@@ -5,22 +5,56 @@ namespace LsSpringTester;
 public sealed class TestSettings
 {
     public double PreloadN { get; set; } = 0.10;
-    public double ApproachSpeedInPerMin { get; set; } = 0.5;
-    public double TestSpeedInPerMin { get; set; } = 2.0;
-    public double ReturnSpeedInPerMin { get; set; } = 4.0;
+    public const double MM_PER_IN = 25.4;
+    public double ApproachSpeedInPerMin { get; set; } = 100.0 / MM_PER_IN;  // preload speed, 100 mm/min
+    public double TestSpeedInPerMin { get; set; } = 100.0 / MM_PER_IN;      // test speed, 100 mm/min
+    public double ReturnSpeedInPerMin { get; set; } = 20.0 / MM_PER_IN;     // jog-mode return
+    public double ReturnFastMmMin { get; set; } = 1200;   // AQM app: 20 (mm/s) → 1200 mm/min until close
+    public double ReturnSlowMmMin { get; set; } = 60;     // AQM app: ~1 mm/s for the last 5 mm
+    public double ReturnSlowZoneMm { get; set; } = 5;
+    public double ReturnTargetMm { get; set; } = 0;
+    /// <summary>Two-point rate: points at these % of the full travel (preload → test length).</summary>
+    public double RatePoint1Pct { get; set; } = 20;
+    public double RatePoint2Pct { get; set; } = 60;       // RETURN goes to this crosshead distance (mm, from zero)
+    public double PreloadDwellSeconds { get; set; } = 1.0;                  // stop + settle at preload before zeroing
     public double JogSpeedInPerMin { get; set; } = 2.0;
-    public double SettleSeconds { get; set; } = 2.0;
+    public double SettleSeconds { get; set; } = 1.0;
     public double SampleSeconds { get; set; } = 0.5;
-    public double MaxPreloadSearchIn { get; set; } = 1.0;
+    public double MaxPreloadSearchIn { get; set; } = 20.0 / MM_PER_IN;   // max travel hunting for 0 N / preload (0 = no limit)
+    public bool AutoPreload { get; set; } = false;            // preload above the spring's initial tension (per spring)
+    public bool PreloadFromZero { get; set; } = true;        // RUN TEST: drive down to 0 N first, then up to preload
+    public double PreloadFractionOfRange { get; set; } = 0.10;
     public double ForceLimitN { get; set; } = 100.0;      // set to your load cell capacity
-    public double PositionToleranceIn { get; set; } = 0.002;
-    public bool ZeroForceAtPreload { get; set; } = false;  // leave OFF (see notes)
+    public double PositionToleranceIn { get; set; } = 0.002;   // ≈0.05 mm (AQM HOME_TOL_MM)
+    public double StaleReadingSeconds { get; set; } = 1.0;
+    public double PreloadOvershootN { get; set; } = 2.0;      // abort if preload overshoots by more than this
+
+    /// <summary>
+    /// false = MtmRunDriveStage at the approach/test speeds (rate sent in mm/s — see LsSerialMachine).
+    /// true  = fallback: machine SLOW JOG (CtlJogMachine), stopping at the target.
+    /// </summary>
+    public bool UseJogMotion { get; set; } = false;
+    public bool PreloadUseJog { get; set; } = false;           // true = slow jog (~3 mm/min, continuous); false = drive at ApproachSpeed
+    public double FinishZoneIn { get; set; } = 0.03;           // frame ignores drives this close → finish with slow jog
+    public double MaxAutoSpeedMmMin { get; set; } = 150;      // jog-mode safety: stop if slow jog exceeds this
+    public double FastApproachZoneIn { get; set; } = 0.12;    // fast jog until ~3 mm from target, then slow jog
+    public bool TestFastApproach { get; set; } = false;       // RUN TEST: fast jog for the bulk (LS1+ fast jog ≈ 1500 mm/min — too fast)
+    public bool ZeroForceAtPreload { get; set; } = true;   // zero force AND position at preload; load result adds the preload back
+    public bool MeasureRate { get; set; } = true;          // two-point rate between the drawing's two load lengths
 }
+
+/// <summary>One settled step: position from preload zero (in) and force (lbf, zeroed at preload).</summary>
+public readonly record struct RatePoint(double PositionIn, double ForceLbf);
 
 public sealed record TestResult(
     SpringSpec Spec, double FreeLengthIn, double TravelIn,
     double MeasuredN, double MeasuredLbf, double FinalPositionIn,
-    bool Pass, DateTime Time, int Samples);
+    bool LoadPass, double? RateLbPerIn, bool? RatePass,
+    DateTime Time, int Samples, IReadOnlyList<RatePoint>? Points = null)
+{
+    /// <summary>Pass/fail is based on the measured spring rate only.</summary>
+    public bool Pass => RatePass == true;
+}
 
 /// <summary>
 /// Owns all motion. Priority model:
@@ -61,11 +95,24 @@ public sealed class MachineController : IDisposable
     public MachineReading Latest { get { lock (_readGate) return _latest; } }
     public bool IsBusy => _activeOp != null;
     public string? ActiveOperation => _activeOp;
+    public double ReadingsHz { get; private set; }
+
+    /// <summary>Force removed by zeroing at the preload; added back to the absolute load reading.</summary>
+    private double _preloadOffsetN;
+
+    /// <summary>
+    /// The ZERO button's position, stored relative to machine home so it survives the re-zero at preload.
+    /// null until ZERO is pressed (then the current zero is used).
+    /// </summary>
+    private double? _startRelHomeIn;
+
+    private double StartPositionIn => _startRelHomeIn is double rel ? _machine.HomePositionIn + rel : 0.0;
 
     // ───────────────────────── connection ─────────────────────────
 
     public async Task ConnectAsync()
     {
+        _machine.CommandSent += cmd => Status(cmd);
         await _machine.ConnectAsync(CancellationToken.None).ConfigureAwait(false);
         _pollCts = new CancellationTokenSource();
         var token = _pollCts.Token;
@@ -106,12 +153,10 @@ public sealed class MachineController : IDisposable
 
     public Task<bool> ReturnToZeroAsync() => RunOpAsync("Return to zero", async ct =>
     {
-        double dist = Math.Abs(Latest.PositionIn);
-        Status($"Returning to zero at {_s.ReturnSpeedInPerMin:0.##} in/min…");
-        await _machine.MoveToAsync(0.0, _s.ReturnSpeedInPerMin, ct).ConfigureAwait(false);
-        var timeout = TimeSpan.FromSeconds(dist / _s.ReturnSpeedInPerMin * 60.0 * 1.5 + 10);
-        await WaitForArrivalAsync(0.0, double.MaxValue, timeout, ct).ConfigureAwait(false);
-        Status("At zero.");
+        double targetMm = _s.ReturnTargetMm;
+        Status($"Returning to {targetMm:0.##} mm at {_s.ReturnFastMmMin:0} mm/min…");
+        await ReturnMoveAsync(targetMm / TestSettings.MM_PER_IN, ct).ConfigureAwait(false);
+        Status($"At {targetMm:0.##} mm.");
         return true;
     }, preempt: true);
 
@@ -120,38 +165,58 @@ public sealed class MachineController : IDisposable
     public Task<bool> TareForceAsync() => RunOpAsync("Tare force", async ct =>
     {
         await _machine.ZeroForceAsync(ct).ConfigureAwait(false);
+        await NextReadingAsync(ct).ConfigureAwait(false);
         Status("Force tared with spring hanging free (spring weight removed).");
+        return true;
+    });
+
+    /// <summary>ZERO button: tare force (spring hanging free) and zero position.</summary>
+    public Task<bool> ZeroAllAsync() => RunOpAsync("Zero", async ct =>
+    {
+        await _machine.ZeroForceAsync(ct).ConfigureAwait(false);
+        await _machine.ZeroPositionAsync(ct).ConfigureAwait(false);
+        await NextReadingAsync(ct).ConfigureAwait(false);
+        _startRelHomeIn = 0.0 - _machine.HomePositionIn;          // remember this spot as the slack start point
+        Status("Force and position zeroed — this is the start position for RUN TEST.");
         return true;
     });
 
     public Task<bool> ZeroPositionAsync() => RunOpAsync("Zero position", async ct =>
     {
         await _machine.ZeroPositionAsync(ct).ConfigureAwait(false);
+        await NextReadingAsync(ct).ConfigureAwait(false);
         Status("Position zeroed.");
         return true;
     });
 
     public Task<bool> HomeAsync() => RunOpAsync("Home", async ct =>
     {
-        Status("Homing…");
-        await _machine.HomeAsync(ct).ConfigureAwait(false);
-        await WaitUntilStoppedAsync(TimeSpan.FromMinutes(3), ct).ConfigureAwait(false);
+        Status("Moving to machine home (machine position 0)…");
+        await ReturnMoveAsync(_machine.HomePositionIn, ct).ConfigureAwait(false);
         Status("Home complete.");
         return true;
     });
 
-    public Task<bool> JogAsync(JogDirection dir)
+    public Task<bool> JogAsync(JogDirection dir, bool fast = false)
     {
         if (IsBusy) { Status($"Busy with {_activeOp} — jog ignored."); return Task.FromResult(false); }
         _jogRequested = true;
         return RunOpAsync("Jog", async ct =>
         {
             if (!_jogRequested) return false;             // released before we started
-            await _machine.JogAsync(dir, _s.JogSpeedInPerMin, ct).ConfigureAwait(false);
+            await _machine.JogAsync(dir, fast, ct).ConfigureAwait(false);
+            double jogStart = Latest.PositionIn;
+            var jogSw = Stopwatch.StartNew();
+            bool warned = false;
             try
             {
                 while (_jogRequested)
                 {
+                    if (!warned && jogSw.ElapsedMilliseconds > 2000 && Math.Abs(Latest.PositionIn - jogStart) < 0.0005)
+                    {
+                        warned = true;
+                        Status("Jog sent but the crosshead isn't moving — check E-stop / limits, or power-cycle the LS1+.");
+                    }
                     ct.ThrowIfCancellationRequested();
                     if (dir == JogDirection.Extend && Latest.ForceN > _s.ForceLimitN)
                     {
@@ -180,31 +245,152 @@ public sealed class MachineController : IDisposable
     }
 
     /// <summary>
-    /// Creep in the extend direction until force ≥ preload, stop, then zero POSITION.
-    /// Force is NOT re-zeroed by default, so the preload stays in the final reading.
+    /// Drive UP if force is below the preload, DOWN if above, stop when it crosses, settle,
+    /// then zero POSITION. Force is not re-zeroed, so the preload stays in the final reading.
     /// </summary>
-    public Task<bool> FindPreloadAsync() => RunOpAsync("Find preload", async ct =>
-    {
-        double preload = _s.PreloadN;
-        var start = Latest;
-        if (start.ForceN >= preload)
+    /// <summary>One button: find preload (settle, zero force + position), then the 3-step rate test.</summary>
+    public Task<TestResult?> RunSequenceAsync(SpringSpec spec, double freeLengthIn) =>
+        RunOpAsync<TestResult?>("Run test", async ct =>
         {
-            Status($"Force already ≥ {preload:0.###} N — retract, re-tare, then find preload.");
-            return false;
+            await RestoreForceZeroAsync(ct).ConfigureAwait(false);   // in case a previous run was aborted mid-test
+            if (_s.PreloadFromZero)
+            {
+                // Unload first: drive DOWN until the force reads ~0 (spring slack), whatever load it was hooked in with.
+                const double zeroBandN = 0.02;
+                if (FreshLatest().ForceN > zeroBandN)
+                {
+                    Status("Unloading to 0 N before preload…");
+                    if (!await ApproachForceAsync(0.0, up: false, zeroBandN, ct).ConfigureAwait(false)) return null;
+                    await WaitStoppedAsync(ct).ConfigureAwait(false);
+                }
+            }
+            if (!await FindPreloadCoreAsync(spec, ct).ConfigureAwait(false)) return null;
+            return await RunTestCoreAsync(spec, freeLengthIn, ct).ConfigureAwait(false);
+        });
+
+    public Task<bool> FindPreloadAsync() => RunOpAsync("Find preload", FindPreloadCoreAsync);
+
+    /// <summary>
+    /// Preload that guarantees the spring is really engaged: above the drawing's implied initial tension
+    /// (load at test length − rate × travel) plus 10 % of the working range, never below the Setup minimum.
+    /// </summary>
+    public double PreloadFor(SpringSpec? spec)
+    {
+        if (spec == null || !_s.AutoPreload) return _s.PreloadN;
+        double span = spec.TestLengthIn - spec.NominalFreeLengthIn;
+        double initialTensionLbf = Math.Max(0, spec.LoadNomLbf - spec.RateLbPerIn * span);
+        double lbf = initialTensionLbf + _s.PreloadFractionOfRange * spec.RateLbPerIn * span;
+        return Math.Max(_s.PreloadN, lbf * SpringSpec.N_PER_LBF);
+    }
+
+    private Task<bool> FindPreloadCoreAsync(CancellationToken ct) => FindPreloadCoreAsync(null, ct);
+
+    /// <summary>
+    /// If above the preload, drive DOWN past it; then always finish by driving UP to it (same direction as
+    /// the test, so it never settles in slack). Settle, then zero force + position.
+    /// </summary>
+    private async Task<bool> FindPreloadCoreAsync(SpringSpec? spec, CancellationToken ct)
+    {
+        double preload = PreloadFor(spec);
+        double band = Math.Max(0.01, preload * 0.05);
+        Status($"Preload target {preload:0.###} N ({preload * SpringSpec.N_TO_LBS:0.000} lbf)" +
+               (spec != null && _s.AutoPreload ? " — auto, above initial tension." : "."));
+
+        if (FreshLatest().ForceN > preload + band)
+        {
+            if (!await ApproachForceAsync(preload, up: false, band, ct).ConfigureAwait(false)) return false;
+            await WaitStoppedAsync(ct).ConfigureAwait(false);
+        }
+        if (FreshLatest().ForceN < preload - band)
+        {
+            if (!await ApproachForceAsync(preload, up: true, band, ct).ConfigureAwait(false)) return false;
+            await Task.Delay(200, ct).ConfigureAwait(false);
+            double peak = FreshLatest().ForceN;
+            if (peak > preload + _s.PreloadOvershootN)
+                throw new InvalidOperationException(
+                    $"Overshot preload: {peak:0.00} N vs {preload:0.###} N target. Stopped — lower the preload speed.");
         }
 
-        Status($"Approaching preload ({preload:0.###} N) at {_s.ApproachSpeedInPerMin:0.##} in/min…");
-        await _machine.JogAsync(JogDirection.Extend, _s.ApproachSpeedInPerMin, ct).ConfigureAwait(false);
+        Status($"Holding {_s.PreloadDwellSeconds:0.#} s to settle…");
+        await Task.Delay(TimeSpan.FromSeconds(_s.PreloadDwellSeconds), ct).ConfigureAwait(false);
+        double atPreload = FreshLatest().ForceN;
+        if (atPreload < -preload)
+            throw new InvalidOperationException(
+                $"Force reads NEGATIVE in tension ({atPreload:0.###} N). Set FORCE_SIGN = -1.0 in LsSerialMachine.cs.");
+        if (atPreload < preload * 0.3)
+            throw new InvalidOperationException(
+                $"Force relaxed to {atPreload:0.###} N after settling — spring may not be engaged. Check the hooks and retry.");
+        await _machine.ZeroPositionAsync(ct).ConfigureAwait(false);
+        _preloadOffsetN = 0;
+        if (_s.ZeroForceAtPreload)
+        {
+            await _machine.ZeroForceAsync(ct).ConfigureAwait(false);
+            _preloadOffsetN = atPreload;
+        }
+        await NextReadingAsync(ct).ConfigureAwait(false);   // don't let a pre-zero sample look like motion
 
-        bool found = false;
+        Status($"Preload settled at {atPreload:0.###} N. Position zeroed" +
+               (_s.ZeroForceAtPreload ? " and force zeroed." : ".") + " Spring engaged — measuring rate.");
+        return true;
+    }
+
+    /// <summary>Drive in one direction until force crosses the target (±band). Returns false if not reached.</summary>
+    private async Task<bool> ApproachForceAsync(double target, bool up, double band, CancellationToken ct)
+    {
+        var start = FreshLatest();
+        bool useJog = _s.UseJogMotion || _s.PreloadUseJog;
+        var dir = up ? JogDirection.Extend : JogDirection.Retract;
+        Status($"Force {start.ForceN:0.###} N → driving {(up ? "UP" : "DOWN")} to {target:0.###} N" +
+               (useJog ? " (slow jog)…" : $" at {_s.ApproachSpeedInPerMin * TestSettings.MM_PER_IN:0.#} mm/min…"));
+
+        double limitIn = _s.MaxPreloadSearchIn > 0 ? _s.MaxPreloadSearchIn : 5.0;   // "no limit" → 127 mm drive target
+        double searchTarget = start.PositionIn + (up ? 1 : -1) * limitIn;
+        async Task Issue()
+        {
+            if (useJog) await _machine.JogAsync(dir, false, ct).ConfigureAwait(false);
+            else
+            {
+                await WaitStoppedAsync(ct).ConfigureAwait(false);
+                await _machine.MoveToAsync(searchTarget, _s.ApproachSpeedInPerMin, ct).ConfigureAwait(false);
+            }
+        }
+        await Issue().ConfigureAwait(false);
+
+        var speedMon = new SpeedMonitor();
+        var grace = Stopwatch.StartNew();
+        var sinceProgress = Stopwatch.StartNew();
+        double lastPos = start.PositionIn, posAtResume = start.PositionIn;
+        int idleResumes = 0;
+        bool movedSinceIssue = false;
         try
         {
             while (true)
             {
                 ct.ThrowIfCancellationRequested();
-                var r = Latest;
-                if (r.ForceN >= preload) { found = true; break; }
-                if (r.PositionIn - start.PositionIn > _s.MaxPreloadSearchIn) break;
+                var r = FreshLatest();
+                if (grace.ElapsedMilliseconds > 600) CheckSpeed(speedMon, r, useJog ? null : _s.ApproachSpeedInPerMin);
+                else speedMon.MmPerMin(r);
+
+                if (up ? r.ForceN >= target - band : r.ForceN <= target + band) return true;
+                if (_s.MaxPreloadSearchIn > 0 && Math.Abs(r.PositionIn - start.PositionIn) >= _s.MaxPreloadSearchIn - 0.003)
+                {
+                    Status($"{(up ? "Preload" : "0 N")} not reached within {_s.MaxPreloadSearchIn * TestSettings.MM_PER_IN:0.#} mm " +
+                           "(Setup → Max search distance; 0 = no limit).");
+                    return false;
+                }
+
+                if (Math.Abs(r.PositionIn - lastPos) > 0.0001) { lastPos = r.PositionIn; sinceProgress.Restart(); movedSinceIssue = true; }
+                else if (sinceProgress.ElapsedMilliseconds > ResumeAfterMs(movedSinceIssue))
+                {
+                    idleResumes = Math.Abs(r.PositionIn - posAtResume) < 0.0005 ? idleResumes + 1 : 0;
+                    if (idleResumes >= 2) throw new InvalidOperationException(NotRespondingMsg);
+                    posAtResume = r.PositionIn;
+                    movedSinceIssue = false;
+                    await Issue().ConfigureAwait(false);
+                    sinceProgress.Restart();
+                    grace.Restart();
+                    speedMon = new SpeedMonitor();
+                }
                 await Task.Delay(5, ct).ConfigureAwait(false);
             }
         }
@@ -212,55 +398,81 @@ public sealed class MachineController : IDisposable
         {
             await _machine.StopAsync().ConfigureAwait(false);
         }
+    }
 
-        if (!found)
-        {
-            Status($"No preload within {_s.MaxPreloadSearchIn:0.##} in of travel — is the lower hook attached?");
-            return false;
-        }
-
-        await Task.Delay(300, ct).ConfigureAwait(false);          // let the crosshead come to rest
-        double atPreload = Latest.ForceN;
-        await _machine.ZeroPositionAsync(ct).ConfigureAwait(false);
-        if (_s.ZeroForceAtPreload) await _machine.ZeroForceAsync(ct).ConfigureAwait(false);
-
-        Status($"Preload reached ({atPreload:0.###} N). Position zeroed" +
-               (_s.ZeroForceAtPreload ? " and force zeroed." : ".") + " Ready to run test.");
-        return true;
-    });
 
     /// <summary>
     /// One machine-side move to (test length − free length), stop, settle, average, compare.
     /// </summary>
-    public Task<TestResult?> RunTestAsync(SpringSpec spec, double freeLengthIn) => RunOpAsync<TestResult?>("Run test", async ct =>
+    /// <summary>
+    /// After FIND PRELOAD (force + position zeroed), step the spring to 3 lengths evenly spaced between the
+    /// drawing's two load lengths (2.37 / 2.52 / 2.67 in main, 2.35 / 2.55 / 2.75 in trim). At each step:
+    /// stop, settle, average force + position. Rate = best-fit slope through the 3 points (initial tension
+    /// in trim springs doesn't bias it). Load pass/fail uses step 3 (the test length) plus the preload.
+    /// </summary>
+    public Task<TestResult?> RunTestAsync(SpringSpec spec, double freeLengthIn) =>
+        RunOpAsync<TestResult?>("Run test", ct => RunTestCoreAsync(spec, freeLengthIn, ct));
+
+    private async Task<TestResult?> RunTestCoreAsync(SpringSpec spec, double freeLengthIn, CancellationToken ct)
     {
         double travel = spec.TestLengthIn - freeLengthIn;
         if (travel <= 0 || travel > 3.0)
             throw new InvalidOperationException($"Travel {travel:0.000} in is out of range — check free length.");
 
-        // Guard: never let a wrong-spring selection overload the cell.
         double guardN = Math.Min(_s.ForceLimitN, spec.LoadMaxLbf * SpringSpec.N_PER_LBF * 2.0 + 2.0);
 
-        Status($"Driving {travel:0.000} in (to {spec.TestLengthIn:0.00} in length) at {_s.TestSpeedInPerMin:0.##} in/min…");
-        await _machine.MoveToAsync(travel, _s.TestSpeedInPerMin, ct).ConfigureAwait(false);
+        // Two-point rate at 20 % and 60 % of the full travel from the preload point
+        // (trim: 0.20 / 0.60 in of 1.00 in; main: 0.084 / 0.252 in of 0.42 in).
+        var targets = new List<double> { travel * _s.RatePoint1Pct / 100.0, travel * _s.RatePoint2Pct / 100.0 };
 
-        double expectedSec = travel / _s.TestSpeedInPerMin * 60.0;
-        await WaitForArrivalAsync(travel, guardN, TimeSpan.FromSeconds(expectedSec * 1.5 + 10), ct).ConfigureAwait(false);
+        var points = new List<RatePoint>();
+        double lastN = 0, lastPos = 0; int n = 0;
+        for (int i = 0; i < targets.Count; i++)
+        {
+            string label = $"Point {i + 1}/{targets.Count} ({(i == 0 ? _s.RatePoint1Pct : _s.RatePoint2Pct):0}%)";
+            Status($"{label}: moving to {targets[i]:0.000} in from preload{SpeedText()}");
+            await MoveExactAsync(targets[i], _s.TestSpeedInPerMin, guardN, ct, allowFast: _s.TestFastApproach).ConfigureAwait(false);
+            Status($"{label}: settling {_s.SettleSeconds:0.#} s…");
+            await Task.Delay(TimeSpan.FromSeconds(_s.SettleSeconds), ct).ConfigureAwait(false);
+            (lastN, lastPos, n) = await SampleAsync(TimeSpan.FromSeconds(_s.SampleSeconds), ct).ConfigureAwait(false);
+            points.Add(new RatePoint(lastPos, lastN * SpringSpec.N_TO_LBS));
+            Status($"{label}: {lastN * SpringSpec.N_TO_LBS:0.000} lbf at {lastPos:0.0000} in");
+        }
 
-        Status($"At position. Settling {_s.SettleSeconds:0.#} s…");
-        await Task.Delay(TimeSpan.FromSeconds(_s.SettleSeconds), ct).ConfigureAwait(false);
+        double lbf = (lastN + _preloadOffsetN) * SpringSpec.N_TO_LBS;       // absolute load incl. preload
+        bool loadPass = lbf >= spec.LoadMinLbf && lbf <= spec.LoadMaxLbf;
 
-        Status("Sampling…");
-        var (avgN, n) = await SampleForceAsync(TimeSpan.FromSeconds(_s.SampleSeconds), ct).ConfigureAwait(false);
+        double? rate = null; bool? ratePass = null;
+        if (points.Count >= 2 && points[^1].PositionIn - points[0].PositionIn > 0.02)
+        {
+            rate = BestFitSlope(points);
+            ratePass = rate >= spec.RateMinLbPerIn && rate <= spec.RateMaxLbPerIn;
+        }
+        else Status("Rate not computed — the steps were too close together.");
 
-        double lbf = avgN * SpringSpec.N_TO_LBS;
-        bool pass = lbf >= spec.LoadMinLbf && lbf <= spec.LoadMaxLbf;
-        var result = new TestResult(spec, freeLengthIn, travel, avgN, lbf, Latest.PositionIn, pass, DateTime.Now, n);
+        var result = new TestResult(spec, freeLengthIn, travel, lastN + _preloadOffsetN, lbf, lastPos,
+                                    loadPass, rate, ratePass, DateTime.Now, n, points);
+        await RestoreForceZeroAsync(ct).ConfigureAwait(false);   // back to the ZERO (spring-free) force reference
 
-        Status($"{spec.PartNumber}: {lbf:0.000} lbf ({avgN:0.000} N) — {(pass ? "PASS" : "FAIL")}  " +
-               $"[spec {spec.LoadMinLbf:0.000} – {spec.LoadMaxLbf:0.000} lbf]");
+        Status($"{spec.PartNumber}: rate " + (rate is double rr ? $"{rr:0.000} lb/in" : "—") +
+               $"  [{spec.RateMinLbPerIn:0.000}–{spec.RateMaxLbPerIn:0.000}]  → {(result.Pass ? "PASS" : "FAIL")}");
         return result;
-    });
+    }
+
+
+    /// <summary>Least-squares slope of force (lbf) vs position (in).</summary>
+    private static double BestFitSlope(IReadOnlyList<RatePoint> pts)
+    {
+        double mx = pts.Average(p => p.PositionIn), my = pts.Average(p => p.ForceLbf);
+        double sxy = pts.Sum(p => (p.PositionIn - mx) * (p.ForceLbf - my));
+        double sxx = pts.Sum(p => (p.PositionIn - mx) * (p.PositionIn - mx));
+        return sxy / sxx;
+    }
+
+    private string SpeedText() =>
+        !_s.UseJogMotion ? $" at {_s.TestSpeedInPerMin * TestSettings.MM_PER_IN:0.#} mm/min…"
+        : _s.TestFastApproach ? $" — fast jog, slow jog for the last {_s.FastApproachZoneIn * TestSettings.MM_PER_IN:0.#} mm…"
+        : " at slow-jog speed…";
 
     // ───────────────────────── plumbing ─────────────────────────
 
@@ -309,14 +521,112 @@ public sealed class MachineController : IDisposable
         }
     }
 
-    private async Task WaitForArrivalAsync(double target, double guardN, TimeSpan timeout, CancellationToken ct)
+    private enum MoveOutcome { Arrived, Stalled, Overshot, Near }
+
+    /// <summary>
+    /// Re-issue a drive the LS1+ has dropped. It takes ~0.4 s to start moving after a command, so a drive
+    /// that has not started yet gets 1.5 s; one that moved and then stopped is re-issued after 0.3 s.
+    /// </summary>
+    private static int ResumeAfterMs(bool movedSinceIssue) => movedSinceIssue ? 250 : 2000;
+
+    private const string NotRespondingMsg =
+        "Crosshead is not responding to drive commands. Stopped. Check E-stop / limits; if jog also doesn't move, " +
+        "power-cycle the LS1+ and reconnect.";
+
+    /// <summary>
+    /// Jog mode: slow jog to the target (optionally fast jog first for long return/home moves),
+    ///           stopping early by the measured coast distance; overshoots are corrected by jogging back.
+    /// Drive mode: fast drive to within 0.02 in, then a slow final drive.
+    /// Every motion start stops + settles first (no stacked commands).
+    /// </summary>
+    /// <summary>
+    /// Like the AQM app's Return Home: fast drive (20 mm/s) until 5 mm away, then 60 mm/min to the target.
+    /// </summary>
+    /// <summary>
+    /// Like the AQM app's Return Home: one drive straight to the target at the return speed (the frame stops
+    /// at the target itself), then a gentle finish only if it ended outside tolerance.
+    /// </summary>
+    private async Task ReturnMoveAsync(double target, CancellationToken ct)
     {
+        if (!_s.UseJogMotion)
+        {
+            var o = await DriveAndWaitAsync(target, _s.ReturnFastMmMin / TestSettings.MM_PER_IN,
+                                            _s.PositionToleranceIn, double.MaxValue, ct, stopAtTarget: false).ConfigureAwait(false);
+            await WaitStoppedAsync(ct).ConfigureAwait(false);
+            if (o == MoveOutcome.Arrived && Math.Abs(FreshLatest().PositionIn - target) <= _s.PositionToleranceIn * 2) return;
+            await MoveExactAsync(target, _s.ReturnSlowMmMin / TestSettings.MM_PER_IN, double.MaxValue, ct).ConfigureAwait(false);
+        }
+        else await MoveExactAsync(target, _s.ReturnSpeedInPerMin, double.MaxValue, ct, allowFast: true).ConfigureAwait(false);
+    }
+
+    private async Task MoveExactAsync(double target, double speedInPerMin, double guardN, CancellationToken ct, bool allowFast = false)
+    {
+        double tol = _s.PositionToleranceIn;
+
+        if (!_s.UseJogMotion)
+        {
+            // Drive the whole way at the set speed; the LS1+ ignores drives < ~0.5 mm, so any small
+            // remainder (short stop / overshoot) is finished with slow jog.
+            var o = await DriveAndWaitAsync(target, speedInPerMin, tol, guardN, ct).ConfigureAwait(false);
+            if (o == MoveOutcome.Arrived && await SettledWithinAsync(target, tol * 2, ct).ConfigureAwait(false)) return;
+        }
+        else
+        {
+            double dist = target - FreshLatest().PositionIn;
+            double zone = _s.FastApproachZoneIn;
+            if (allowFast && Math.Abs(dist) > zone * 1.5)
+            {
+                await DriveAndWaitAsync(target - Math.Sign(dist) * zone, 0, zone * 0.25, guardN, ct, fastJog: true).ConfigureAwait(false);
+                await WaitStoppedAsync(ct).ConfigureAwait(false);
+            }
+        }
+
+        for (int attempt = 0; attempt < 4; attempt++)
+        {
+            var outcome = await DriveAndWaitAsync(target, 0, tol, guardN, ct, forceJog: true).ConfigureAwait(false);
+            if (outcome == MoveOutcome.Stalled) throw new InvalidOperationException(NotRespondingMsg);
+            if (outcome == MoveOutcome.Arrived && await SettledWithinAsync(target, tol * 2, ct).ConfigureAwait(false)) return;
+        }
+        throw new InvalidOperationException(
+            $"Could not settle within ±{tol:0.0000} in of {target:0.0000} in (at {Latest.PositionIn:0.0000} in).");
+    }
+
+    private async Task<bool> SettledWithinAsync(double target, double tol, CancellationToken ct)
+    {
+        await Task.Delay(300, ct).ConfigureAwait(false);
+        return Math.Abs(FreshLatest().PositionIn - target) <= tol;
+    }
+
+    private async Task<MoveOutcome> DriveAndWaitAsync(double target, double speedInPerMin, double tol, double guardN,
+                                                      CancellationToken ct, bool fastJog = false, bool forceJog = false,
+                                                      bool stopAtTarget = true)
+    {
+        double startPos = FreshLatest().PositionIn;
+        if (Math.Abs(target - startPos) <= tol) return MoveOutcome.Arrived;
+        int dir = Math.Sign(target - startPos);
+        bool jog = _s.UseJogMotion || forceJog || fastJog;
+
+        if (jog) await _machine.JogAsync(dir > 0 ? JogDirection.Extend : JogDirection.Retract, fastJog, ct).ConfigureAwait(false);
+        else
+        {
+            await WaitStoppedAsync(ct).ConfigureAwait(false);   // never stack a drive on a crosshead still decelerating
+            await _machine.MoveToAsync(target, speedInPerMin, ct).ConfigureAwait(false);
+        }
+
+        var timeout = jog ? TimeSpan.FromMinutes(10)
+                          : TimeSpan.FromSeconds(Math.Abs(target - startPos) / speedInPerMin * 60.0 * 1.5 + 10);
         var sw = Stopwatch.StartNew();
-        bool sawMoving = false;
+        var grace = Stopwatch.StartNew();
+        var sinceProgress = Stopwatch.StartNew();
+        double lastPos = startPos, posAtResume = startPos;
+        int idleResumes = 0;
+        bool movedSinceIssue = false;
+        var speedMon = new SpeedMonitor();
+
         while (true)
         {
             ct.ThrowIfCancellationRequested();
-            var r = Latest;
+            var r = FreshLatest();
 
             if (Math.Abs(r.ForceN) > guardN)
             {
@@ -325,55 +635,156 @@ public sealed class MachineController : IDisposable
                     $"Force {r.ForceN:0.00} N exceeded guard {guardN:0.00} N — wrong spring selected?");
             }
 
-            if (r.IsMoving) sawMoving = true;
-            bool atTarget = Math.Abs(r.PositionIn - target) <= _s.PositionToleranceIn;
-            long ms = sw.ElapsedMilliseconds;
+            // Skip the first 0.6 s: acceleration / coast from the previous motion isn't this move's speed.
+            if (!fastJog && grace.ElapsedMilliseconds > 600) CheckSpeed(speedMon, r, jog ? null : speedInPerMin);
+            else speedMon.MmPerMin(r);
 
-            if (!r.IsMoving && atTarget && (sawMoving || ms > 500)) return;
+            // In jog mode, stop early by the distance the crosshead coasts (~80 ms at current speed).
+            double lead = jog ? (speedMon.Last ?? 0) / 60.0 / TestSettings.MM_PER_IN * 0.08 : 0;
+            double err = target - r.PositionIn;
+            if (Math.Abs(err) <= tol + lead)
+            {
+                if (stopAtTarget || jog) await _machine.StopAsync().ConfigureAwait(false);
+                return MoveOutcome.Arrived;
+            }
+            if (Math.Sign(err) != dir) { await _machine.StopAsync().ConfigureAwait(false); return MoveOutcome.Overshot; }
 
-            if (!r.IsMoving && !atTarget && ms > 300 && (sawMoving || ms > 1500))
-                throw new InvalidOperationException(
-                    $"Crosshead stopped at {r.PositionIn:0.0000} in, short of {target:0.0000} in.");
+            if (Math.Abs(r.PositionIn - lastPos) > 0.0001) { lastPos = r.PositionIn; sinceProgress.Restart(); movedSinceIssue = true; }
+            else if (!jog && sinceProgress.ElapsedMilliseconds > ResumeAfterMs(movedSinceIssue))
+            {
+                if (Math.Abs(err) <= _s.FinishZoneIn)
+                {
+                    await _machine.StopAsync().ConfigureAwait(false);
+                    return MoveOutcome.Near;      // too close for a drive — caller finishes with slow jog
+                }
+                // LS1+ drops a drive after ~1 s — re-issue it (MoveToAsync stops + settles first).
+                idleResumes = Math.Abs(r.PositionIn - posAtResume) < 0.0005 ? idleResumes + 1 : 0;
+                if (idleResumes >= 2)
+                {
+                    await _machine.StopAsync().ConfigureAwait(false);
+                    throw new InvalidOperationException(NotRespondingMsg);
+                }
+                posAtResume = r.PositionIn;
+                movedSinceIssue = false;
+                await WaitStoppedAsync(ct).ConfigureAwait(false);
+                await _machine.MoveToAsync(target, speedInPerMin, ct).ConfigureAwait(false);
+                sinceProgress.Restart();
+                grace.Restart();
+                speedMon = new SpeedMonitor();
+            }
+            else if (jog && sinceProgress.ElapsedMilliseconds > 2500)
+            {
+                await _machine.StopAsync().ConfigureAwait(false);
+                return MoveOutcome.Stalled;
+            }
 
             if (sw.Elapsed > timeout)
             {
                 await _machine.StopAsync().ConfigureAwait(false);
                 throw new TimeoutException($"Move to {target:0.000} in timed out.");
             }
-
-            await Task.Delay(10, ct).ConfigureAwait(false);
+            await Task.Delay(5, ct).ConfigureAwait(false);
         }
     }
 
-    private async Task WaitUntilStoppedAsync(TimeSpan timeout, CancellationToken ct)
+    /// <summary>
+    /// Measures crosshead speed from the position stream. If the frame moves much faster than
+    /// commanded (e.g. a speed-unit mismatch), stop immediately.
+    /// </summary>
+    private sealed class SpeedMonitor
     {
-        var sw = Stopwatch.StartNew();
-        await Task.Delay(300, ct).ConfigureAwait(false);
-        while (Latest.IsMoving)
+        private readonly Queue<(DateTime t, double p)> _q = new();
+        public double? Last { get; private set; }
+        public double? MmPerMin(MachineReading r)
         {
-            if (sw.Elapsed > timeout)
-            {
-                await _machine.StopAsync().ConfigureAwait(false);
-                throw new TimeoutException("Motion timed out.");
-            }
-            await Task.Delay(20, ct).ConfigureAwait(false);
+            if (_q.Count == 0 || _q.Last().t != r.Time) _q.Enqueue((r.Time, r.PositionIn));
+            while (_q.Count > 2 && (r.Time - _q.Peek().t).TotalSeconds > 0.6) _q.Dequeue();
+            var first = _q.Peek();
+            double dt = (r.Time - first.t).TotalSeconds;
+            if (dt < 0.25) return null;
+            Last = Math.Abs(r.PositionIn - first.p) / dt * 60.0 * TestSettings.MM_PER_IN;
+            return Last;
         }
     }
 
-    private async Task<(double avgN, int n)> SampleForceAsync(TimeSpan window, CancellationToken ct)
+    /// <param name="commandedInPerMin">null = jog mode (checked against MaxAutoSpeedMmMin instead).</param>
+    private void CheckSpeed(SpeedMonitor mon, MachineReading r, double? commandedInPerMin)
+    {
+        if (mon.MmPerMin(r) is not double actual) return;
+        if (commandedInPerMin is double c)
+        {
+            double cmd = c * TestSettings.MM_PER_IN;
+            if (actual > cmd * 2.0 + 3.0)
+            {
+                _ = _machine.StopAsync();
+                throw new InvalidOperationException(
+                    $"SPEED WATCHDOG: crosshead moving {actual:0} mm/min but {cmd:0.#} mm/min was commanded. Stopped. " +
+                    "Switch MOTION to 'Slow jog' on the Setup page.");
+            }
+        }
+        else if (actual > _s.MaxAutoSpeedMmMin)
+        {
+            _ = _machine.StopAsync();
+            throw new InvalidOperationException(
+                $"SPEED WATCHDOG: slow jog is moving {actual:0} mm/min, above the {_s.MaxAutoSpeedMmMin:0} mm/min limit. Stopped.");
+        }
+    }
+
+    /// <summary>Undo the force zero taken at the preload, so force reads against the ZERO (spring-free) tare again.</summary>
+    private async Task RestoreForceZeroAsync(CancellationToken ct)
+    {
+        if (_preloadOffsetN == 0) return;
+        await _machine.ShiftForceZeroAsync(_preloadOffsetN).ConfigureAwait(false);
+        _preloadOffsetN = 0;
+        await NextReadingAsync(ct).ConfigureAwait(false);
+    }
+
+    /// <summary>Wait (max 2 s) until the crosshead has stopped moving.</summary>
+    private async Task WaitStoppedAsync(CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
-        double sum = 0; int n = 0; DateTime last = default;
+        await Task.Delay(150, ct).ConfigureAwait(false);
+        while (FreshLatest().IsMoving && sw.ElapsedMilliseconds < 2000)
+            await Task.Delay(20, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>Wait until a reading newer than 'now' has arrived (so offsets just applied are reflected).</summary>
+    private async Task NextReadingAsync(CancellationToken ct)
+    {
+        var since = DateTime.UtcNow;
+        var sw = Stopwatch.StartNew();
+        while (Latest.Time <= since)
+        {
+            if (sw.Elapsed.TotalSeconds > _s.StaleReadingSeconds)
+                throw new InvalidOperationException("No readings from the machine — check the readings port (COM4).");
+            await Task.Delay(5, ct).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Latest reading, or throw if the readings stream has gone quiet.</summary>
+    private MachineReading FreshLatest()
+    {
+        var r = Latest;
+        if ((DateTime.UtcNow - r.Time).TotalSeconds > _s.StaleReadingSeconds)
+            throw new InvalidOperationException("No readings from the machine — check the readings port (COM4).");
+        return r;
+    }
+
+    /// <summary>Average force and position over a window of distinct readings.</summary>
+    private async Task<(double avgN, double avgPosIn, int n)> SampleAsync(TimeSpan window, CancellationToken ct)
+    {
+        var sw = Stopwatch.StartNew();
+        double sumF = 0, sumP = 0; int n = 0; DateTime last = default;
         while (sw.Elapsed < window || n == 0)
         {
             ct.ThrowIfCancellationRequested();
             if (n == 0 && sw.Elapsed > window + TimeSpan.FromSeconds(2))
                 throw new InvalidOperationException("No force readings received while sampling.");
             var r = Latest;
-            if (r.Time != last) { sum += r.ForceN; n++; last = r.Time; }
+            if (r.Time != last) { sumF += r.ForceN; sumP += r.PositionIn; n++; last = r.Time; }
             await Task.Delay(5, ct).ConfigureAwait(false);
         }
-        return (sum / n, n);
+        return (sumF / n, sumP / n, n);
     }
 
     private async Task PollLoopAsync(CancellationToken ct)
@@ -383,7 +794,13 @@ public sealed class MachineController : IDisposable
             try
             {
                 var r = await _machine.ReadAsync(ct).ConfigureAwait(false);
-                lock (_readGate) _latest = r;
+                MachineReading prev;
+                lock (_readGate) { prev = _latest; _latest = r; }
+                if (r.Time != prev.Time && prev.Time != default)
+                {
+                    double dt = (r.Time - prev.Time).TotalSeconds;
+                    if (dt > 0) ReadingsHz = ReadingsHz * 0.9 + (1.0 / dt) * 0.1;
+                }
                 ReadingUpdated?.Invoke(r);
 
                 // Global over-force watchdog (fires once per exceedance so Return can still run).
