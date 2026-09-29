@@ -23,6 +23,17 @@ public sealed class SimulatedLsMachine : ILsMachine
     private bool _connected;
 
     public bool IsConnected => _connected;
+    /// <summary>Test hook: makes the sim move faster than commanded (e.g. 60 = unit mismatch).</summary>
+    public double SpeedMultiplier { get; set; } = 1.0;
+    /// <summary>Emulates the LS1+ stopping a drive stage by itself (seconds; 0 = never).</summary>
+    public double DriveDropoutSeconds { get; set; } = 1.1;
+    /// <summary>Emulates the LS1+ taking a moment to start moving after a drive command.</summary>
+    public double DriveStartLatencySeconds { get; set; } = 0.4;
+    private double _driveStartT = -1;
+    public event Action<string>? CommandSent;
+    /// <summary>In the simulator, keep-alive simply suppresses the emulated drive dropouts.</summary>
+    public bool KeepAliveDrives { get; set; }
+    private double? _loadTargetN;    // load-mode drive target (tared N)
 
     public void LoadSpring(SpringSpec s)
     {
@@ -53,47 +64,62 @@ public sealed class SimulatedLsMachine : ILsMachine
 
     public Task StopAsync()
     {
-        lock (_g) { Update(); _vel = 0; _target = null; }
+        lock (_g) { Update(); _vel = 0; _target = null; _loadTargetN = null; }
+        CommandSent?.Invoke("SIM stop");
         return Task.CompletedTask;
     }
 
-    public Task JogAsync(JogDirection dir, double speedInPerMin, CancellationToken ct)
+    public const double SimSlowJogMmMin = 3, SimFastJogMmMin = 1500;   // measured on the LS1+
+
+    public Task JogAsync(JogDirection dir, bool fast, CancellationToken ct)
     {
         lock (_g)
         {
             Update();
             _target = null;
-            _vel = (dir == JogDirection.Extend ? 1 : -1) * speedInPerMin / 60.0;
+            _loadTargetN = null;
+            _vel = (dir == JogDirection.Extend ? 1 : -1) * (fast ? SimFastJogMmMin : SimSlowJogMmMin) / 25.4 / 60.0;
+            _driveStartT = -1;
         }
+        CommandSent?.Invoke($"SIM jog {dir} {(fast ? "fast" : "slow")}");
+        return Task.CompletedTask;
+    }
+
+    public Task DriveToLoadAsync(double loadN, double speedInPerMin, CancellationToken ct)
+    {
+        lock (_g)
+        {
+            Update();
+            _target = null;
+            _loadTargetN = loadN;
+            _vel = speedInPerMin / 60.0 * SpeedMultiplier;
+            _driveStartT = _lastT;
+        }
+        CommandSent?.Invoke($"SIM drive-to-load {loadN:0.###} N @ {speedInPerMin * 25.4:0.#} mm/min");
         return Task.CompletedTask;
     }
 
     public Task MoveToAsync(double positionIn, double speedInPerMin, CancellationToken ct)
     {
+        CommandSent?.Invoke($"SIM move-to {positionIn:0.0000} in @ {speedInPerMin * 25.4:0.#} mm/min");
         lock (_g)
         {
             Update();
             double tgt = positionIn + _posZero;
+            if (Math.Abs(tgt - _pos) < 0.02) { _vel = 0; _target = null; return Task.CompletedTask; }   // LS1+ ignores tiny drives
             _target = tgt;
-            _vel = Math.Sign(tgt - _pos) * speedInPerMin / 60.0;
+            _loadTargetN = null;
+            _vel = Math.Sign(tgt - _pos) * speedInPerMin / 60.0 * SpeedMultiplier;
+            _driveStartT = _lastT;
             if (_vel == 0) _target = null;
         }
         return Task.CompletedTask;
     }
 
-    public Task HomeAsync(CancellationToken ct)
-    {
-        lock (_g)
-        {
-            Update();
-            _target = 0;
-            _vel = Math.Sign(0 - _pos) * 10.0 / 60.0;
-            if (_vel == 0) _target = null;
-        }
-        return Task.CompletedTask;
-    }
+    public double HomePositionIn { get { lock (_g) return -_posZero; } }
 
     public Task ZeroForceAsync(CancellationToken ct) { lock (_g) { Update(); _forceZero = TrueForceN(); } return Task.CompletedTask; }
+    public Task ShiftForceZeroAsync(double deltaN) { lock (_g) _forceZero -= deltaN; return Task.CompletedTask; }
     public Task ZeroPositionAsync(CancellationToken ct) { lock (_g) { Update(); _posZero = _pos; } return Task.CompletedTask; }
 
     private double TrueForceN()
@@ -109,6 +135,12 @@ public sealed class SimulatedLsMachine : ILsMachine
         double dt = t - _lastT;
         _lastT = t;
         if (_vel == 0) return;
+        if (_driveStartT >= 0 && !KeepAliveDrives && DriveDropoutSeconds > 0 && t - _driveStartT > DriveDropoutSeconds + DriveStartLatencySeconds)
+        {
+            _vel = 0; _target = null; _loadTargetN = null; _driveStartT = -1;
+            return;
+        }
+        if (_driveStartT >= 0 && t - _driveStartT < DriveStartLatencySeconds) return;   // not moving yet
         double step = _vel * dt;
         if (_target is double tgt)
         {
@@ -117,6 +149,7 @@ public sealed class SimulatedLsMachine : ILsMachine
             else _pos += step;
         }
         else _pos += step;
+        if (_loadTargetN is double lt && TrueForceN() - _forceZero >= lt) { _vel = 0; _loadTargetN = null; }
     }
 
     public void Dispose() { _connected = false; }
