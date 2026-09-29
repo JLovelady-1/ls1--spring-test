@@ -24,6 +24,13 @@ public sealed record SpringSpec(
     public double NominalFreeLengthIn =>
         Family == SpringFamily.Main ? SpringSpecs.MainFreeLengthIn : SpringSpecs.TrimFreeLengthIn;
 
+    /// <summary>First length used for the rate measurement: the drawing's other load column (2.37 main / 2.35 trim).</summary>
+    public double RateStartLengthIn =>
+        Family == SpringFamily.Main ? SpringSpecs.MainRateStartLengthIn : SpringSpecs.TrimRateStartLengthIn;
+
+    public double RateMinLbPerIn => RateLbPerIn - RateTolLbPerIn;
+    public double RateMaxLbPerIn => RateLbPerIn + RateTolLbPerIn;
+
     public double LoadMinLbf => LoadNomLbf - LoadTolLbf;
     public double LoadMaxLbf => LoadNomLbf + LoadTolLbf;
 
@@ -46,8 +53,10 @@ public static class SpringSpecs
 {
     public const double MainFreeLengthIn = 2.25;   // NC002679 inspection length 2.25 ±.05
     public const double MainTestLengthIn = 2.67;   // "LOAD AT 2.67 IN" column
+    public const double MainRateStartLengthIn = 2.37;   // "LOAD AT 2.37 IN" column
     public const double TrimFreeLengthIn = 1.75;   // NC002712 1.75 REF
     public const double TrimTestLengthIn = 2.75;   // "LOAD AT 2.75 IN" column
+    public const double TrimRateStartLengthIn = 2.35;   // "LOAD AT 2.35 IN" column
 
     private static SpringSpec M(string dash, string cap, double rate, double rtol, double load, double tol, string c1, string c2) =>
         new($"NC002679-{dash}", SpringFamily.Main, cap, rate, rtol, MainTestLengthIn, load, tol, c1, c2);
