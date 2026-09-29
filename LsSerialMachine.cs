@@ -1,158 +1,409 @@
 using System.Globalization;
 using System.IO.Ports;
+using System.Text;
 
 namespace LsSpringTester;
 
 /// <summary>
-/// ═══════════════════════════════════════════════════════════════════════════════
-///  PORT FROM THE AQM APP: fill in the TODO command strings, baud rate, units and
-///  the Parse* methods using the same LS1 protocol code you already have working.
-///  Connect() refuses to open the port while any TODO remains, so nothing unknown
-///  is ever sent to the frame. Use Simulator mode until this is filled in.
-/// ═══════════════════════════════════════════════════════════════════════════════
-/// Conventions the controller relies on:
-///   • Force returned in NEWTONS, + = tension.
-///   • Position returned in INCHES, + = spring extension (crosshead moving away).
-///     If the frame reports mm or the opposite sign, convert here (MM_PER_IN / sign).
-///   • Stop is written immediately (it only takes the byte-level write lock, never the
-///     transaction lock), so it can't get stuck behind a poll.
+/// LS1+ adapter, ported from the AQM calibrator (WinFormsApp1/Form1.cs):
+///
+///   CONTROL  port (COM5)  57600 8N1, RTS/DTR on, commands end in "\n"
+///       CtlJogMachine(0)            stop
+///       CtlJogMachine(1) / (2)      slow jog up / down  (machine times out → re-sent every 300 ms)
+///       MtmRunDriveStage(1, 0, targetMm, rateMmPerSec, 0, 0, 0,0,0,0, false, 0)   drive to position (rate = mm/s)
+///       Every drive is preceded by stop + 150 ms settle (stacked drives lock up the LS1+).
+///
+///   READINGS port (COM4)  9600 8N1, ASCII lines, tab-separated, streamed by the machine
+///       4 \t 0 \t <position mm>
+///       4 \t 1 \t <load N>
+///       2 \t ... (9-field status line, not used here)
+///
+/// Tare/zero are done in SOFTWARE (offsets on the streamed values) so force can be tared
+/// without touching position and vice versa; CtlZeroReadings is not used.
+/// "Is moving" is derived from the position stream, since the status line isn't decoded.
 /// </summary>
 public sealed class LsSerialMachine : ILsMachine
 {
-    // ── TODO: copy from the AQM app ─────────────────────────────────────────────
-    private const int BAUD = 9600;                               // TODO: confirm
-    private const string NEWLINE = "\r";                         // TODO: confirm terminator
-    private const string CMD_STOP = "TODO";
-    private const string CMD_READ_FORCE = "TODO";
-    private const string CMD_READ_POSITION = "TODO";
-    private const string CMD_READ_STATUS = "TODO";               // must tell us moving / not moving
-    private const string CMD_ZERO_FORCE = "TODO";
-    private const string CMD_ZERO_POSITION = "TODO";
-    private const string CMD_HOME = "TODO";
-    private const string CMD_JOG_EXTEND_FMT = "TODO {0}";        // {0} = speed in machine units
-    private const string CMD_JOG_RETRACT_FMT = "TODO {0}";
-    private const string CMD_MOVE_TO_FMT = "TODO {0} {1}";       // {0} = position, {1} = speed
-    private const bool   COMMANDS_RETURN_ACK = true;             // TODO: does every command reply?
+    // ── Protocol constants (from the AQM app) ────────────────────────────────
+    private const int CONTROL_BAUD = 57600;
+    private const int READINGS_BAUD = 9600;
+    private const string CMD_STOP = "CtlJogMachine(0)";
+    private const string CMD_JOG_UP_SLOW = "CtlJogMachine(1)";
+    private const string CMD_JOG_DOWN_SLOW = "CtlJogMachine(2)";
+    private const string CMD_JOG_UP_FAST = "CtlJogMachine(3)";
+    private const string CMD_JOG_DOWN_FAST = "CtlJogMachine(4)";
+    private const int JOG_KEEPALIVE_MS = 300;
+    // Harmless Lua call used as a heartbeat while a drive stage runs (CtlSetVariable is used by NEXYGEN itself).
+    private const string CMD_DRIVE_KEEPALIVE = "CtlSetVariable('lsst_keepalive', 1)";
+    private const int DRIVE_KEEPALIVE_MS = 250;
+    private const int SETTLE_BEFORE_DRIVE_MS = 150;
     private const double MM_PER_IN = 25.4;
-    private const double POSITION_SIGN = +1.0;                   // flip if extension reads negative
-    private const double FORCE_SIGN = +1.0;                      // flip if tension reads negative
-    // ────────────────────────────────────────────────────────────────────────────
 
-    private readonly string _portName;
-    private readonly SemaphoreSlim _txLock = new(1, 1);
+    // Firmware signature (Lloyd.MaterialTestMachineFirmware, Common/DriveStageLib.lua):
+    //   MtmRunDriveStage(stageId, ds, limit, rate, speedType, speedDS, gaugeLength,
+    //                    holdTime, rampUpTime, rampDownTime, <bool>, <int>)
+    // ServiceUtility calls it as MtmRunDriveStage(1, Crosshead, 5, 40 / 60, 0, Crosshead, 0,0,0,0, false, 0)
+    // → 'rate' is in mm per SECOND. We work in mm/min, so divide by 60.
+    private const double SPEED_SCALE = 1.0 / 60.0;
+
+    // ── Frame orientation — VERIFY ON FIRST RUN ──────────────────────────────
+    // Assumes crosshead UP stretches the spring and the machine reports up as +mm.
+    // If jogging "extend" compresses the spring, or position counts down while
+    // extending, flip EXTEND_IS_UP.
+    private const bool EXTEND_IS_UP = true;
+    private const double POS_SIGN = EXTEND_IS_UP ? 1.0 : -1.0;
+    private const double FORCE_SIGN = 1.0;          // AQM app: tension targets are +N
+
+    // Motion detection from the position stream
+    private const double MOVE_THRESHOLD_MM = 0.002;
+    private const int MOVING_HOLD_MS = 300;
+
+    private readonly string _controlPortName, _readingsPortName;
     private readonly object _writeGate = new();
-    private SerialPort? _port;
+    private readonly object _stateGate = new();
 
-    public LsSerialMachine(string portName) => _portName = portName;
+    private SerialPort? _ctl, _rd;
+    private Thread? _rdThread;
+    private volatile bool _rdRunning;
+    private System.Threading.Timer? _jogTimer;   // explicit: WinForms also has a Timer
+    private string? _jogCmd;           // guarded by _writeGate
+    private bool _driveActive;         // guarded by _writeGate
+    private System.Threading.Timer? _driveTimer;
+    public bool KeepAliveDrives { get; set; } = true;
+    private long _motionGen;           // bumped by every Stop; guarded by _writeGate
 
-    public bool IsConnected => _port?.IsOpen == true;
+    // streamed state (guarded by _stateGate)
+    private double _rawPosMm, _rawLoadN, _posZeroMm, _loadZeroN;
+    private bool _havePos, _haveLoad;
+    private DateTime _lastLineUtc;
+    private double _motionRefMm;
+    private DateTime _lastMoveUtc;
 
-    public Task ConnectAsync(CancellationToken ct)
+    public LsSerialMachine(string controlPort, string readingsPort)
     {
-        var all = new[] { CMD_STOP, CMD_READ_FORCE, CMD_READ_POSITION, CMD_READ_STATUS, CMD_ZERO_FORCE,
-                          CMD_ZERO_POSITION, CMD_HOME, CMD_JOG_EXTEND_FMT, CMD_JOG_RETRACT_FMT, CMD_MOVE_TO_FMT };
-        if (all.Any(c => c.Contains("TODO")))
-            throw new NotImplementedException(
-                "LsSerialMachine has unfilled TODO commands — port the LS1 protocol from the AQM app first.");
-        if (string.IsNullOrWhiteSpace(_portName))
-            throw new InvalidOperationException("No COM port selected.");
+        _controlPortName = controlPort;
+        _readingsPortName = readingsPort;
+    }
 
-        _port = new SerialPort(_portName, BAUD, Parity.None, 8, StopBits.One)
+    public bool IsConnected => _ctl?.IsOpen == true && _rd?.IsOpen == true;
+    public event Action<string>? CommandSent;
+
+    // ─────────────────────────── connection ───────────────────────────
+
+    public async Task ConnectAsync(CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(_controlPortName) || string.IsNullOrWhiteSpace(_readingsPortName))
+            throw new InvalidOperationException("Select both the control (COM5) and readings (COM4) ports.");
+
+        _ctl = new SerialPort(_controlPortName, CONTROL_BAUD, Parity.None, 8, StopBits.One)
         {
-            NewLine = NEWLINE,
-            ReadTimeout = 500,
+            ReadTimeout = 200,
             WriteTimeout = 500,
+            RtsEnable = true,
+            DtrEnable = true,
         };
-        _port.Open();
-        return Task.CompletedTask;
+        _ctl.Open();
+        _ctl.DiscardInBuffer();
+        _ctl.DiscardOutBuffer();
+
+        _rd = new SerialPort(_readingsPortName, READINGS_BAUD, Parity.None, 8, StopBits.One)
+        {
+            Encoding = Encoding.ASCII,
+            NewLine = "\n",
+            ReadTimeout = 200,
+        };
+        _rd.Open();
+
+        _rdRunning = true;
+        _rdThread = new Thread(ReadingsThreadProc) { IsBackground = true, Name = "LS readings", Priority = ThreadPriority.AboveNormal };
+        _rdThread.Start();
+
+        _jogTimer = new System.Threading.Timer(JogKeepAlive, null, Timeout.Infinite, Timeout.Infinite);
+        _driveTimer = new System.Threading.Timer(DriveKeepAlive, null, Timeout.Infinite, Timeout.Infinite);
+
+        // Make sure the machine is stopped and actually streaming before we hand control over.
+        WriteNow(CMD_STOP);
+        var deadline = DateTime.UtcNow.AddSeconds(3);
+        while (DateTime.UtcNow < deadline)
+        {
+            lock (_stateGate) { if (_havePos && _haveLoad) return; }
+            await Task.Delay(50, ct).ConfigureAwait(false);
+        }
+        throw new InvalidOperationException(
+            $"No position/load data on {_readingsPortName} within 3 s — check the readings cable/port.");
     }
 
     public Task DisconnectAsync()
     {
-        try { _port?.Close(); } catch { }
+        try { StopAsync(); } catch { }
+        Shutdown();
         return Task.CompletedTask;
     }
 
-    public async Task<MachineReading> ReadAsync(CancellationToken ct)
+    // ─────────────────────────── readings ───────────────────────────
+
+    public Task<MachineReading> ReadAsync(CancellationToken ct)
     {
-        string f = await QueryAsync(CMD_READ_FORCE, ct).ConfigureAwait(false);
-        string p = await QueryAsync(CMD_READ_POSITION, ct).ConfigureAwait(false);
-        string s = await QueryAsync(CMD_READ_STATUS, ct).ConfigureAwait(false);
-        return new MachineReading(ParseForceN(f), ParsePositionIn(p), ParseIsMoving(s), DateTime.UtcNow);
+        lock (_stateGate)
+        {
+            bool moving = (DateTime.UtcNow - _lastMoveUtc).TotalMilliseconds < MOVING_HOLD_MS;
+            return Task.FromResult(new MachineReading(
+                FORCE_SIGN * (_rawLoadN - _loadZeroN),
+                POS_SIGN * (_rawPosMm - _posZeroMm) / MM_PER_IN,
+                moving,
+                _lastLineUtc));
+        }
     }
 
-    // PRIORITY: bypasses the transaction lock. Synchronous by contract.
+    public double HomePositionIn
+    {
+        get { lock (_stateGate) return POS_SIGN * (0.0 - _posZeroMm) / MM_PER_IN; }
+    }
+
+    public Task ZeroForceAsync(CancellationToken ct)
+    {
+        lock (_stateGate) _loadZeroN = _rawLoadN;
+        return Task.CompletedTask;
+    }
+
+    public Task ShiftForceZeroAsync(double deltaN)
+    {
+        lock (_stateGate) _loadZeroN -= FORCE_SIGN * deltaN;
+        return Task.CompletedTask;
+    }
+
+    public Task ZeroPositionAsync(CancellationToken ct)
+    {
+        lock (_stateGate) _posZeroMm = _rawPosMm;
+        return Task.CompletedTask;
+    }
+
+    private void ReadingsThreadProc()
+    {
+        var sb = new StringBuilder();
+        while (_rdRunning)
+        {
+            try
+            {
+                var port = _rd;
+                if (port is not { IsOpen: true }) { Thread.Sleep(100); continue; }
+                int avail = port.BytesToRead;
+                if (avail <= 0) { Thread.Sleep(5); continue; }
+
+                var buf = new byte[avail];
+                int n = port.Read(buf, 0, avail);
+                sb.Append(Encoding.ASCII.GetString(buf, 0, n));
+
+                string all = sb.ToString();
+                int nl;
+                while ((nl = all.IndexOf('\n')) >= 0)
+                {
+                    string line = all.Substring(0, nl).Trim();
+                    all = all.Substring(nl + 1);
+                    if (line.Length > 0) ProcessLine(line);
+                }
+                sb.Clear();
+                sb.Append(all);
+                if (sb.Length > 512) sb.Clear();
+            }
+            catch (TimeoutException) { }
+            catch (Exception)
+            {
+                if (!_rdRunning) break;
+                Thread.Sleep(200);
+                try { _rd?.DiscardInBuffer(); } catch { }
+            }
+        }
+    }
+
+    private void ProcessLine(string line)
+    {
+        var parts = line.Split('\t');
+        if (parts.Length < 3 || parts[0] != "4") return;
+        if (!double.TryParse(parts[2], NumberStyles.Float, CultureInfo.InvariantCulture, out double v)) return;
+
+        var now = DateTime.UtcNow;
+        lock (_stateGate)
+        {
+            if (parts[1] == "0")
+            {
+                _rawPosMm = v;
+                _havePos = true;
+                if (Math.Abs(v - _motionRefMm) > MOVE_THRESHOLD_MM) { _motionRefMm = v; _lastMoveUtc = now; }
+                _lastLineUtc = now;
+            }
+            else if (parts[1] == "1")
+            {
+                _rawLoadN = v;
+                _haveLoad = true;
+                _lastLineUtc = now;
+            }
+        }
+    }
+
+    // ─────────────────────────── motion ───────────────────────────
+
+    /// <summary>PRIORITY. Synchronous; cancels jog keep-alive and any pending drive.</summary>
     public Task StopAsync()
     {
-        var port = _port;
-        if (port is { IsOpen: true })
+        lock (_writeGate)
         {
-            lock (_writeGate) port.Write(CMD_STOP + port.NewLine);
+            _jogCmd = null;
+            _driveActive = false;
+            _motionGen++;
+            WriteLocked(CMD_STOP);
         }
-        // NOTE: if the frame ACKs the stop, a concurrent poll may read that ACK instead of its
-        // own reply. Parse* should reject non-numeric replies (they throw → poll retries).
         return Task.CompletedTask;
     }
 
-    public Task JogAsync(JogDirection dir, double speedInPerMin, CancellationToken ct)
+    public Task JogAsync(JogDirection dir, bool fast, CancellationToken ct)
     {
-        string fmt = dir == JogDirection.Extend ? CMD_JOG_EXTEND_FMT : CMD_JOG_RETRACT_FMT;
-        return SendAsync(string.Format(CultureInfo.InvariantCulture, fmt, SpeedToMachine(speedInPerMin)), ct);
+        bool up = (dir == JogDirection.Extend) == EXTEND_IS_UP;
+        lock (_writeGate)
+        {
+            _driveActive = false;
+            _jogCmd = up ? (fast ? CMD_JOG_UP_FAST : CMD_JOG_UP_SLOW)
+                         : (fast ? CMD_JOG_DOWN_FAST : CMD_JOG_DOWN_SLOW);
+            WriteLocked(_jogCmd);
+            CommandSent?.Invoke($"TX {_jogCmd}  (held, repeated every {JOG_KEEPALIVE_MS} ms)");
+        }
+        _jogTimer?.Change(JOG_KEEPALIVE_MS, JOG_KEEPALIVE_MS);
+        return Task.CompletedTask;
     }
 
-    public Task MoveToAsync(double positionIn, double speedInPerMin, CancellationToken ct) =>
-        SendAsync(string.Format(CultureInfo.InvariantCulture, CMD_MOVE_TO_FMT,
-            PositionToMachine(positionIn), SpeedToMachine(speedInPerMin)), ct);
-
-    public Task HomeAsync(CancellationToken ct) => SendAsync(CMD_HOME, ct);
-    public Task ZeroForceAsync(CancellationToken ct) => SendAsync(CMD_ZERO_FORCE, ct);
-    public Task ZeroPositionAsync(CancellationToken ct) => SendAsync(CMD_ZERO_POSITION, ct);
-
-    // ── unit conversion (TODO: match what the frame expects) ──
-    private static double PositionToMachine(double inches) => POSITION_SIGN * inches * MM_PER_IN;   // mm
-    private static double SpeedToMachine(double inPerMin) => inPerMin * MM_PER_IN;                   // mm/min
-
-    // ── reply parsing (TODO: match the frame's reply format) ──
-    private static double ParseForceN(string reply) =>
-        FORCE_SIGN * double.Parse(reply.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture);
-
-    private static double ParsePositionIn(string reply) =>
-        POSITION_SIGN * double.Parse(reply.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture) / MM_PER_IN;
-
-    private static bool ParseIsMoving(string reply) =>
-        throw new NotImplementedException("TODO: decode the status reply into moving / stopped.");
-
-    // ── transport ──
-    private async Task<string> QueryAsync(string cmd, CancellationToken ct)
+    // call with _writeGate held
+    private void StartDriveKeepAlive()
     {
-        await _txLock.WaitAsync(ct).ConfigureAwait(false);
-        try
-        {
-            return await Task.Run(() =>
-            {
-                var port = _port ?? throw new InvalidOperationException("Not connected.");
-                lock (_writeGate) { port.DiscardInBuffer(); port.Write(cmd + port.NewLine); }
-                return port.ReadLine();
-            }, ct).ConfigureAwait(false);
-        }
-        finally { _txLock.Release(); }
+        _driveActive = KeepAliveDrives;
+        if (_driveActive) _driveTimer?.Change(DRIVE_KEEPALIVE_MS, DRIVE_KEEPALIVE_MS);
     }
 
-    private async Task SendAsync(string cmd, CancellationToken ct)
+    private void DriveKeepAlive(object? _)
     {
-        if (COMMANDS_RETURN_ACK) { await QueryAsync(cmd, ct).ConfigureAwait(false); return; }
-        await _txLock.WaitAsync(ct).ConfigureAwait(false);
-        try
+        lock (_writeGate)
         {
-            var port = _port ?? throw new InvalidOperationException("Not connected.");
-            lock (_writeGate) port.Write(cmd + port.NewLine);
+            if (!_driveActive) { _driveTimer?.Change(Timeout.Infinite, Timeout.Infinite); return; }
+            try { WriteLocked(CMD_DRIVE_KEEPALIVE, log: false); } catch { }
         }
-        finally { _txLock.Release(); }
+    }
+
+    private void JogKeepAlive(object? _)
+    {
+        lock (_writeGate)
+        {
+            if (_jogCmd == null) { _jogTimer?.Change(Timeout.Infinite, Timeout.Infinite); return; }
+            WriteLocked(_jogCmd);
+        }
+    }
+
+    public async Task MoveToAsync(double positionIn, double speedInPerMin, CancellationToken ct)
+    {
+        double targetMm;
+        lock (_stateGate) targetMm = _posZeroMm + POS_SIGN * positionIn * MM_PER_IN;
+        double speedMm = Math.Max(0.01, speedInPerMin * MM_PER_IN) * SPEED_SCALE;
+
+        long gen;
+        lock (_writeGate)
+        {
+            _jogCmd = null;
+            _driveActive = false;
+            _motionGen++;
+            gen = _motionGen;
+            WriteLocked(CMD_STOP);                       // never stack drive commands
+        }
+
+        await Task.Delay(SETTLE_BEFORE_DRIVE_MS, ct).ConfigureAwait(false);
+
+        lock (_writeGate)
+        {
+            // A STOP issued during the settle wins — don't send the drive.
+            if (gen != _motionGen || ct.IsCancellationRequested) return;
+            WriteLocked(DriveCmd(0, targetMm, speedMm));
+            StartDriveKeepAlive();
+        }
+    }
+
+    public async Task DriveToLoadAsync(double loadN, double speedInPerMin, CancellationToken ct)
+    {
+        double targetRawN;
+        lock (_stateGate) targetRawN = _loadZeroN + FORCE_SIGN * loadN;     // tare is software-side
+        double speed = Math.Max(0.01, speedInPerMin * MM_PER_IN) * SPEED_SCALE;
+
+        long gen;
+        lock (_writeGate)
+        {
+            _jogCmd = null;
+            _driveActive = false;
+            _motionGen++;
+            gen = _motionGen;
+            WriteLocked(CMD_STOP);
+        }
+        await Task.Delay(SETTLE_BEFORE_DRIVE_MS, ct).ConfigureAwait(false);
+        lock (_writeGate)
+        {
+            if (gen != _motionGen || ct.IsCancellationRequested) return;
+            WriteLocked(DriveCmd(1, targetRawN, speed));
+            StartDriveKeepAlive();
+        }
+    }
+
+    // ds (limit data source): 0 = crosshead position (mm), 1 = load (N) — same as the AQM app.
+    // speedType 0, speedDS 0 (crosshead), no gauge length / hold / ramps — matches the
+    // ServiceUtility production-test call.
+    // Firmware (Common/DriveStageLib.lua):
+    //   MtmRunDriveStageEx(stageId, ds, limit, rate, speedType, speedDS, gaugeLength, holdTime,
+    //                      rampUpTime, rampDownTime, isFollowOn, requestId, detectors)
+    //   • requestId ~= 0 → the frame ACKs this long-running call immediately (NEXYGEN always passes one).
+    //     With requestId = 0 there is no ack, and the drive was being cut off after ~1 s.
+    //   • isFollowOn = false → MtmRunStage (runs to the limit); true → start + return immediately.
+    // A request id makes the drive a long BLOCKING call on the frame; interrupting one mid-move can leave the
+    // frame ignoring all further commands (seen 9/29). Keep 0 and use the keep-alive for smooth motion.
+    private const bool USE_REQUEST_ID = false;
+    private const bool USE_FOLLOW_ON = false;
+    private int _requestId;
+
+    private string DriveCmd(int channel, double target, double rateMmPerSec)
+    {
+        string t = target.ToString("F4", CultureInfo.InvariantCulture);
+        string s = rateMmPerSec.ToString("F6", CultureInfo.InvariantCulture);
+        _requestId = !USE_REQUEST_ID ? 0 : (_requestId >= 30000 ? 1 : _requestId + 1);
+        string followOn = USE_FOLLOW_ON ? "true" : "false";
+        return $"MtmRunDriveStage(1, {channel}, {t}, {s}, 0, 0, 0, 0, 0, 0, {followOn}, {_requestId})";
+    }
+
+    // ─────────────────────────── transport ───────────────────────────
+
+    private void WriteNow(string cmd)
+    {
+        lock (_writeGate) WriteLocked(cmd);
+    }
+
+    private void WriteLocked(string cmd, bool log = true)
+    {
+        var port = _ctl;
+        if (port is not { IsOpen: true }) return;
+        port.DiscardInBuffer();                          // replies aren't used
+        port.Write(cmd + "\n");
+        if (log && (!ReferenceEquals(cmd, _jogCmd) || cmd == CMD_STOP)) CommandSent?.Invoke("TX " + cmd);
+    }
+
+    private void Shutdown()
+    {
+        _rdRunning = false;
+        try { _jogTimer?.Dispose(); } catch { }
+        _jogTimer = null;
+        try { _driveTimer?.Dispose(); } catch { }
+        _driveTimer = null;
+        try { _rdThread?.Join(500); } catch { }
+        try { _ctl?.Close(); _ctl?.Dispose(); } catch { }
+        try { _rd?.Close(); _rd?.Dispose(); } catch { }
+        _ctl = null;
+        _rd = null;
     }
 
     public void Dispose()
     {
         try { StopAsync(); } catch { }
-        try { _port?.Dispose(); } catch { }
+        Shutdown();
     }
 }
