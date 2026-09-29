@@ -1,196 +1,489 @@
+using System.Drawing.Drawing2D;
 using System.Globalization;
 using System.IO.Ports;
 using System.Text;
+using static LsSpringTester.Ui;
 
 namespace LsSpringTester;
 
 public sealed class MainForm : Form
 {
-    // ── palette (dark dashboard: near-black-blue, #2563EB blue, #22C55E green) ──
-    private static readonly Color Bg = ColorTranslator.FromHtml("#0F172A");
-    private static readonly Color CardBg = ColorTranslator.FromHtml("#1E293B");
-    private static readonly Color InputBg = ColorTranslator.FromHtml("#0B1222");
-    private static readonly Color Line = ColorTranslator.FromHtml("#334155");
-    private static readonly Color Text1 = ColorTranslator.FromHtml("#E2E8F0");
-    private static readonly Color Muted = ColorTranslator.FromHtml("#94A3B8");
-    private static readonly Color Blue = ColorTranslator.FromHtml("#2563EB");
-    private static readonly Color Green = ColorTranslator.FromHtml("#22C55E");
-    private static readonly Color Red = ColorTranslator.FromHtml("#DC2626");
-    private static readonly Color StopRed = ColorTranslator.FromHtml("#991B1B");
-    private static readonly Color Amber = ColorTranslator.FromHtml("#F59E0B");
-    private static readonly Color Neutral = ColorTranslator.FromHtml("#475569");
-    private const int CardWidth = 400;
-
-    // ── state ──
+    // ═════════════════════════════ state ═════════════════════════════
     private ILsMachine? _machine;
     private MachineController? _ctl;
     private readonly TestSettings _settings = new();
     private readonly List<TestResult> _results = new();
     private bool _tared, _preloaded;
+    private SpringFamily _family = SpringFamily.Main;
+    private TestResult? _lastResult;
 
-    // ── controls ──
-    private readonly ComboBox cboMode = DarkCombo();
-    private readonly ComboBox cboPort = DarkCombo();
-    private readonly ComboBox cboPart = DarkCombo();
-    private readonly Button btnConnect = Btn("Connect", Blue);
+    private readonly Queue<double> _loadHistory = new();
+    private const int CHART_POINTS = 300;
+    private readonly System.Windows.Forms.Timer _uiTimer = new() { Interval = 100 };
 
-    private readonly RadioButton rbMain = Radio("Main  (NC002679)");
-    private readonly RadioButton rbTrim = Radio("Trim  (NC002712)");
-    private readonly NumericUpDown numFree = Num(3, 0.500m, 3.000m, 2.250m, 0.005m);
-    private readonly Label lblSpec = new() { AutoSize = true, ForeColor = Text1, MaximumSize = new Size(CardWidth - 30, 0), Margin = new Padding(3, 6, 3, 3) };
+    // ═════════════════════════════ controls ═════════════════════════════
+    // sidebar
+    private readonly List<RoundedButton> _navBtns = new();
+    private Panel _navMarker = null!;
+    private readonly RoundedButton btnStop = new() { Text = "■   STOP   (Esc)", Radius = 10 };
+    private readonly RoundedButton btnReturn = new() { Text = "⟲   RETURN\nTO ZERO", Radius = 10 };
+    private readonly Label lblConn = new() { Text = "● LS1+  OFFLINE" };
+    private readonly NumericUpDown numReturnTo = Nud(2, -500m, 500m, 0m, 1m);   // mm
+    private readonly Label lblReturnTo = new() { Text = "RETURN TO (mm)" };
+    private readonly Panel[] _pages = new Panel[3];
 
-    private readonly Button btnTare = Btn("1. Tare force", Blue);
-    private readonly Button btnPreload = Btn("2. Find preload", Blue);
-    private readonly Button btnRun = Btn("3. RUN TEST", Green, 12f, true);
-    private readonly NumericUpDown numPreload = Num(3, 0.010m, 5.000m, 0.100m, 0.010m);
-    private readonly NumericUpDown numSpeed = Num(2, 0.10m, 20.00m, 2.00m, 0.10m);
-    private readonly NumericUpDown numSettle = Num(1, 0.0m, 30.0m, 2.0m, 0.5m);
-    private readonly NumericUpDown numForceLimit = Num(0, 1m, 5000m, 100m, 10m);
-    private readonly CheckBox chkZeroForceAtPreload = new() { Text = "Also zero force at preload (not recommended)", ForeColor = Muted, AutoSize = true };
+    // test page — left
+    private readonly Label lblLoad = new() { Text = "0.0000" };
+    private readonly Label lblLoadN = new() { Text = "0.0000 N" };
+    private readonly Label lblMotion = new() { Text = "● OFFLINE" };
+    private readonly Label lblHz = new() { Text = "" };
+    private readonly Label lblPos = new() { Text = "0.0000 in" };
+    private readonly Label lblPosMm = new() { Text = "0.000 mm" };
+    private readonly BufferedPanel chart = new();
 
-    private readonly Button btnJogExt = Btn("▲ Jog extend (hold)", Neutral);
-    private readonly Button btnJogRet = Btn("▼ Jog retract (hold)", Neutral);
-    private readonly Button btnZeroF = Btn("Zero force", Neutral);
-    private readonly Button btnZeroP = Btn("Zero position", Neutral);
-    private readonly Button btnHome = Btn("Home", Neutral);
+    // test page — right
+    private readonly RoundedButton btnMain = new() { Text = "MAIN" };
+    private readonly RoundedButton btnTrim = new() { Text = "TRIM" };
+    private readonly ComboBox cboPart = Combo(true);
+    private readonly NumericUpDown numFree = Nud(3, 0.500m, 3.000m, 2.250m, 0.005m);
+    private readonly Label lblSpec = new();
+    private readonly RoundedButton btnNominal = new() { Text = "NOMINAL", Font = new Font("Segoe UI", 7.5f, FontStyle.Bold) };
 
-    private readonly Button btnStop = Btn("■  STOP   (Esc)", StopRed, 16f, true);
-    private readonly Button btnReturn = Btn("⟲  RETURN TO ZERO", Red, 20f, true);
-    private readonly Button btnExport = Btn("Export CSV", Neutral);
-    private readonly Button btnClear = Btn("Clear", Neutral);
+    // ── passcode lock for Setup parameters + free length ──
+    // CHANGE THE PASSCODE HERE:
+    private const string SETTINGS_PASSCODE = "2679";
+    private bool _unlocked;
+    private readonly List<Control> _lockables = new();
+    private readonly RoundedButton btnLock = new() { Text = "🔒  UNLOCK" };
+    private readonly RoundedButton btnTare = new() { Text = "1   ZERO" };
+    private readonly RoundedButton btnPreload = new() { Text = "2   FIND PRELOAD" };
+    private readonly RoundedButton btnRun = new() { Text = "2   RUN TEST" };
+    private readonly Label lblHint = new();
+    private RoundedPanel _resultCard = null!;
+    private readonly Label lblResultTag = new();
+    private readonly Label lblResult = new() { Text = "READY" };
+    private readonly Label lblResultDetail = new();
+    private readonly RoundedButton btnJogExt = new() { Text = "▲  SLOW" };
+    private readonly RoundedButton btnJogRet = new() { Text = "▼  SLOW" };
+    private readonly RoundedButton btnJogExtFast = new() { Text = "▲▲  FAST" };
+    private readonly RoundedButton btnJogRetFast = new() { Text = "▼▼  FAST" };
+    private readonly Label lblSpeed = new() { Text = "" };
+    private readonly Queue<(DateTime t, double p)> _speedSamples = new();
+    private readonly RoundedButton btnZeroF = new() { Text = "ZERO FORCE" };
+    private readonly RoundedButton btnZeroP = new() { Text = "ZERO POSITION" };
 
-    private readonly Label lblForce = new() { Text = "—" };
-    private readonly Label lblPos = new() { Text = "—" };
-    private readonly Label lblState = new() { Text = "—" };
-    private readonly Label lblResult = new() { TextAlign = ContentAlignment.MiddleCenter, ForeColor = Color.White, Font = new Font("Segoe UI", 56f, FontStyle.Bold) };
-    private readonly Label lblResultDetail = new() { TextAlign = ContentAlignment.MiddleCenter, ForeColor = Color.White, Font = new Font("Segoe UI", 13f), Height = 56 };
-    private readonly Label lblStatus = new() { Dock = DockStyle.Fill, ForeColor = Muted, TextAlign = ContentAlignment.MiddleLeft };
+    // results page
     private readonly DataGridView grid = new();
-    private Panel _resultPanel = null!;
+    private readonly RoundedButton btnExport = new() { Text = "EXPORT CSV" };
+    private readonly RoundedButton btnClear = new() { Text = "CLEAR" };
+    private readonly Label lblTally = new();
+    private readonly ListBox lstLog = new();
+
+    // setup page
+    private readonly ComboBox cboMode = Combo();
+    private readonly ComboBox cboPort = Combo();       // control (COM5)
+    private readonly ComboBox cboPortRead = Combo();   // readings (COM4)
+    private readonly ComboBox cboMotion = Combo();
+    private readonly NumericUpDown numMaxSpeed = Nud(0, 5m, 2000m, 150m, 10m);
+    private readonly NumericUpDown numSlowZone = Nud(1, 0.5m, 20.0m, 3.0m, 0.5m);   // mm
+    private readonly CheckBox chkRate = new()
+    {
+        Text = "Measure spring rate  (3 steps: 2.37/2.52/2.67 main, 2.35/2.55/2.75 trim)", AutoSize = true, Checked = true,
+        ForeColor = TEXT_MID, BackColor = CARD, Font = new Font("Segoe UI", 9f),
+    };
+    private readonly CheckBox chkAutoPreload = new()
+    {
+        Text = "Auto preload per spring  (above initial tension + 10% of range)", AutoSize = true, Checked = false,
+        ForeColor = TEXT_MID, BackColor = CARD, Font = new Font("Segoe UI", 9f),
+    };
+    private readonly CheckBox chkFromZero = new()
+    {
+        Text = "Unload to 0 N first, then drive up to the preload", AutoSize = true, Checked = true,
+        ForeColor = TEXT_MID, BackColor = CARD, Font = new Font("Segoe UI", 9f),
+    };
+    private readonly CheckBox chkPreloadJog = new()
+    {
+        Text = "Find preload with slow jog instead  (continuous but fixed ~3 mm/min)", AutoSize = true, Checked = false,
+        ForeColor = TEXT_MID, BackColor = CARD, Font = new Font("Segoe UI", 9f),
+    };
+    private readonly CheckBox chkKeepAlive = new()
+    {
+        Text = "Keep drives alive  (smooth, continuous drives)", AutoSize = true, Checked = true,
+        ForeColor = TEXT_MID, BackColor = CARD, Font = new Font("Segoe UI", 9f),
+    };
+    private readonly CheckBox chkFastTest = new()
+    {
+        Text = "Fast jog for the test move  (LS1+ fast jog is ~1500 mm/min — leave off)", AutoSize = true, Checked = false,
+        ForeColor = TEXT_MID, BackColor = CARD, Font = new Font("Segoe UI", 9f),
+    };
+    private readonly RoundedButton btnConnect = new() { Text = "CONNECT" };
+    private readonly RoundedButton btnDisconnect = new() { Text = "DISCONNECT" };
+    private readonly NumericUpDown numPreload = Nud(3, 0.010m, 5.000m, 0.100m, 0.010m);
+    private readonly NumericUpDown numApproach = Nud(1, 1.0m, 300.0m, 100.0m, 5.0m);
+    private readonly NumericUpDown numPreloadDwell = Nud(1, 0.0m, 10.0m, 1.0m, 0.5m);
+    private readonly NumericUpDown numSpeed = Nud(1, 1.0m, 300.0m, 100.0m, 5.0m);
+    private readonly NumericUpDown numSettle = Nud(1, 0.0m, 30.0m, 1.0m, 0.5m);
+    private readonly NumericUpDown numReturn = Nud(0, 20m, 2000m, 1200m, 50m);   // mm/min
+    private readonly NumericUpDown numSearch = Nud(0, 0m, 200m, 20m, 5m);   // mm, 0 = no limit
+    private readonly NumericUpDown numP1 = Nud(0, 5m, 95m, 20m, 5m);    // % of travel
+    private readonly NumericUpDown numP2 = Nud(0, 10m, 100m, 60m, 5m);  // % of travel
+    private readonly NumericUpDown numForceLimit = Nud(0, 1m, 5000m, 100m, 10m);
+    private readonly CheckBox chkZeroForceAtPreload = new()
+    {
+        Text = "Zero force at preload too  (load result adds the preload back)", AutoSize = true, Checked = true,
+        ForeColor = TEXT_MID, BackColor = CARD, Font = new Font("Segoe UI", 9f),
+    };
 
     public MainForm()
     {
-        Text = "LS Spring Tester — NC002679 Main / NC002712 Trim";
-        BackColor = Bg;
-        ForeColor = Text1;
-        Font = new Font("Segoe UI", 9.75f);
-        ClientSize = new Size(1380, 860);
-        MinimumSize = new Size(1200, 800);
+        Text = "AMETEK  ·  LS1+ Spring Test System";
+        BackColor = BG;
+        ForeColor = INK;
+        Font = new Font("Segoe UI", 9f);
+        WindowState = FormWindowState.Maximized;
+        MinimumSize = new Size(1280, 800);
         StartPosition = FormStartPosition.CenterScreen;
         KeyPreview = true;
         DoubleBuffered = true;
 
         BuildUi();
-        SetupGrid();
         WireEvents();
 
-        cboMode.Items.AddRange(new object[] { "Simulator", "LS machine (serial)" });
-        cboMode.SelectedIndex = 0;
+        cboMode.Items.AddRange(new object[] { "Simulator", "LS1+ machine (serial)" });
+        cboMode.SelectedIndex = 1;
+        cboMotion.Items.AddRange(new object[] { "Slow jog (fallback)", "Drive stage (set speed)" });
+        cboMotion.SelectedIndex = 1;
         PopulatePorts();
-        rbMain.Checked = true;
-        PopulateParts();
+        SelectFamily(SpringFamily.Main);
+        ShowPage(2);                         // start on Setup until connected
         UpdateEnables();
-        SetStatus("Select a spring, then Connect.");
+        SetStatus("Choose ports and connect.");
+
+        _uiTimer.Tick += (_, _) => UiTick();
+        _uiTimer.Start();
     }
 
     // ═════════════════════════════ layout ═════════════════════════════
 
     private void BuildUi()
     {
-        var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Padding = new Padding(12), BackColor = Bg };
-        root.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, CardWidth + 24));
-        root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        Controls.Add(root);
+        var host = new Panel { Dock = DockStyle.Fill, BackColor = BG };
+        Controls.Add(host);
+        BuildSidebar();
+        host.BringToFront();
 
-        // ── left column ──
-        var left = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoScroll = true, BackColor = Bg, Margin = new Padding(0) };
-        root.Controls.Add(left, 0, 0);
+        for (int i = 0; i < 3; i++)
+        {
+            _pages[i] = new Panel { Dock = DockStyle.Fill, BackColor = BG, Visible = false, Padding = new Padding(18) };
+            host.Controls.Add(_pages[i]);
+        }
+        BuildTestPage(_pages[0]);
+        BuildResultsPage(_pages[1]);
+        BuildSetupPage(_pages[2]);
+    }
 
-        var cConn = Card("CONNECTION");
-        AddRow(cConn, Lbl("Mode"), cboMode);
-        AddRow(cConn, Lbl("COM port"), cboPort);
-        AddRow(cConn, btnConnect);
-        left.Controls.Add(cConn);
+    private void BuildSidebar()
+    {
+        var nav = new Panel { Dock = DockStyle.Left, Width = 200, BackColor = SIDEBAR };
+        nav.Paint += (_, e) =>
+        {
+            using var pen = new Pen(BORDER, 1);
+            e.Graphics.DrawLine(pen, nav.Width - 1, 0, nav.Width - 1, nav.Height);
+        };
+        Controls.Add(nav);
 
-        var cSpring = Card("SPRING");
-        var rbPanel = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, BackColor = CardBg, Margin = new Padding(0) };
-        rbPanel.Controls.Add(rbMain);
-        rbPanel.Controls.Add(rbTrim);
-        AddRow(cSpring, rbPanel);
-        AddRow(cSpring, cboPart);
-        AddRow(cSpring, Lbl("Free length (in)"), numFree);
-        AddRow(cSpring, lblSpec);
-        left.Controls.Add(cSpring);
+        var brand = new Panel { Left = 0, Top = 0, Width = 200, Height = 72, BackColor = SIDEBAR };
+        brand.Paint += (_, e) =>
+        {
+            var g = e.Graphics;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+            using var wf = new Font("Arial Black", 14f, FontStyle.Bold);
+            using var ink = new SolidBrush(INK);
+            g.DrawString("AMETEK", wf, ink, 18, 16);
+            using var sf = new Font("Segoe UI", 7f);
+            using var dim = new SolidBrush(TEXT_DIM);
+            g.DrawString(Spaced("SPRING TEST SYSTEM"), sf, dim, 19, 42);
+        };
+        nav.Controls.Add(brand);
 
-        var cTest = Card("TEST SEQUENCE");
-        AddRow(cTest, btnTare);
-        AddRow(cTest, btnPreload);
-        AddRow(cTest, btnRun);
-        AddRow(cTest, Lbl("Preload (N)"), numPreload);
-        AddRow(cTest, Lbl("Test speed (in/min)"), numSpeed);
-        AddRow(cTest, Lbl("Settle time (s)"), numSettle);
-        AddRow(cTest, Lbl("Force limit (N)"), numForceLimit);
-        AddRow(cTest, chkZeroForceAtPreload);
-        left.Controls.Add(cTest);
+        _navMarker = new Panel { Left = 0, Top = 88, Width = 3, Height = 34, BackColor = WHITE };
+        nav.Controls.Add(_navMarker);
 
-        var cMan = Card("MANUAL");
-        AddRow(cMan, btnJogExt, btnJogRet);
-        AddRow(cMan, btnZeroF, btnZeroP);
-        AddRow(cMan, btnHome);
-        left.Controls.Add(cMan);
+        string[] names = { "Spring Test", "Results", "Setup" };
+        for (int i = 0; i < names.Length; i++)
+        {
+            int idx = i;
+            var b = new RoundedButton
+            {
+                Text = "   " + names[i], Left = 10, Top = 88 + i * 42, Width = 178, Height = 34,
+                TextAlign = ContentAlignment.MiddleLeft, EdgeSize = 0, Radius = 8,
+                Font = new Font("Segoe UI", 9.5f),
+            };
+            b.Style(SIDEBAR, SIDEBAR, TEXT_MID, 0);
+            b.Click += (_, _) => ShowPage(idx);
+            nav.Controls.Add(b);
+            _navBtns.Add(b);
+        }
 
-        // ── right column ──
-        var right = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 5, BackColor = Bg, Margin = new Padding(12, 0, 0, 0) };
-        right.RowStyles.Add(new RowStyle(SizeType.Absolute, 120));
-        right.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
-        right.RowStyles.Add(new RowStyle(SizeType.Absolute, 100));
-        right.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
-        right.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
-        root.Controls.Add(right, 1, 0);
+        // Priority controls live in the sidebar so they're visible on every page.
+        btnStop.Style(STOP_FILL, STOP_EDGE, Color.White);
+        btnStop.Font = new Font("Segoe UI", 12f, FontStyle.Bold);
+        btnReturn.Style(RETURN_FILL, RETURN_EDGE, Color.White);
+        btnReturn.Font = new Font("Segoe UI", 13f, FontStyle.Bold);
+        nav.Controls.Add(btnStop);
+        nav.Controls.Add(btnReturn);
+        lblReturnTo.BackColor = SIDEBAR;
+        lblReturnTo.ForeColor = TEXT_DIM;
+        lblReturnTo.Font = new Font("Segoe UI", 7.5f, FontStyle.Bold);
+        nav.Controls.Add(lblReturnTo);
+        nav.Controls.Add(numReturnTo);
+        numReturnTo.ValueChanged += (_, _) => UpdateReturnText();
+        UpdateReturnText();
 
-        var live = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 1, BackColor = Bg, Margin = new Padding(0) };
-        for (int i = 0; i < 3; i++) live.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33f));
-        live.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        live.Controls.Add(Readout("FORCE", lblForce), 0, 0);
-        live.Controls.Add(Readout("POSITION  (from preload zero)", lblPos), 1, 0);
-        live.Controls.Add(Readout("MACHINE", lblState), 2, 0);
-        right.Controls.Add(live, 0, 0);
+        lblConn.SetBounds(18, 0, 170, 20);
+        lblConn.BackColor = SIDEBAR;
+        lblConn.ForeColor = TEXT_DIM;
+        lblConn.Font = new Font("Segoe UI", 8f, FontStyle.Bold);
+        nav.Controls.Add(lblConn);
 
-        _resultPanel = new Panel { Dock = DockStyle.Fill, BackColor = Neutral, Margin = new Padding(0, 10, 0, 10) };
-        lblResult.Dock = DockStyle.Fill;
-        lblResultDetail.Dock = DockStyle.Bottom;
-        _resultPanel.Controls.Add(lblResultDetail);
-        _resultPanel.Controls.Add(lblResult);
-        lblResult.BringToFront();
-        right.Controls.Add(_resultPanel, 0, 1);
+        nav.Resize += (_, _) =>
+        {
+            int h = nav.Height;
+            lblConn.Top = h - 34;
+            btnReturn.SetBounds(12, h - 34 - 12 - 92, 176, 92);
+            numReturnTo.SetBounds(104, btnReturn.Top - 8 - 28, 84, 28);
+            lblReturnTo.SetBounds(12, numReturnTo.Top, 94, 28);
+            lblReturnTo.TextAlign = ContentAlignment.MiddleLeft;
+            btnStop.SetBounds(12, numReturnTo.Top - 10 - 58, 176, 58);
+        };
+    }
 
-        var pri = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, BackColor = Bg, Margin = new Padding(0) };
-        pri.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 40));
-        pri.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 60));
-        pri.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        pri.Controls.Add(btnStop, 0, 0);
-        pri.Controls.Add(btnReturn, 1, 0);
-        right.Controls.Add(pri, 0, 2);
+    private void ToggleLock()
+    {
+        if (_unlocked) { _unlocked = false; UpdateEnables(); SetStatus("Settings locked."); return; }
+        if (AskPasscode() == SETTINGS_PASSCODE) { _unlocked = true; SetStatus("Settings unlocked."); }
+        else SetStatus("Incorrect passcode.");
+        UpdateEnables();
+    }
 
-        var resWrap = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, BackColor = CardBg, Padding = new Padding(8), Margin = new Padding(0, 10, 0, 4) };
-        resWrap.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
-        resWrap.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        var resHeader = new FlowLayoutPanel { Dock = DockStyle.Fill, BackColor = CardBg, Margin = new Padding(0) };
-        var resTitle = new Label { Text = "RESULTS", AutoSize = true, ForeColor = Blue, Font = new Font("Segoe UI", 9f, FontStyle.Bold), Margin = new Padding(3, 12, 20, 0) };
-        btnExport.Dock = DockStyle.None; btnExport.Size = new Size(130, 34);
-        btnClear.Dock = DockStyle.None; btnClear.Size = new Size(90, 34);
-        resHeader.Controls.AddRange(new Control[] { resTitle, btnExport, btnClear });
-        resWrap.Controls.Add(resHeader, 0, 0);
-        resWrap.Controls.Add(grid, 0, 1);
-        right.Controls.Add(resWrap, 0, 3);
+    private string? AskPasscode()
+    {
+        using var dlg = new Form
+        {
+            Text = "Unlock settings", FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent,
+            ClientSize = new Size(320, 140), MaximizeBox = false, MinimizeBox = false, BackColor = CARD, ForeColor = INK,
+            Font = new Font("Segoe UI", 9.5f), ShowInTaskbar = false,
+        };
+        var lbl = new Label { Text = "Enter passcode:", Location = new Point(16, 16), AutoSize = true, ForeColor = TEXT_MID };
+        var tb = new TextBox { Location = new Point(16, 42), Width = 288, UseSystemPasswordChar = true, BackColor = CARD_HI, ForeColor = INK, BorderStyle = BorderStyle.FixedSingle };
+        var ok = new Button { Text = "Unlock", DialogResult = DialogResult.OK, Location = new Point(144, 90), Size = new Size(76, 30), FlatStyle = FlatStyle.Flat, BackColor = ACCENT_FILL, ForeColor = DARK_TEXT };
+        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Location = new Point(228, 90), Size = new Size(76, 30), FlatStyle = FlatStyle.Flat, BackColor = CARD_HI, ForeColor = INK };
+        dlg.Controls.AddRange(new Control[] { lbl, tb, ok, cancel });
+        dlg.AcceptButton = ok;
+        dlg.CancelButton = cancel;
+        return dlg.ShowDialog(this) == DialogResult.OK ? tb.Text : null;
+    }
 
-        right.Controls.Add(lblStatus, 0, 4);
+    private double PreloadPreviewN(SpringSpec s)
+    {
+        double min = (double)numPreload.Value;
+        if (!chkAutoPreload.Checked) return min;
+        double span = s.TestLengthIn - s.NominalFreeLengthIn;
+        double it = Math.Max(0, s.LoadNomLbf - s.RateLbPerIn * span);
+        return Math.Max(min, (it + 0.10 * s.RateLbPerIn * span) * SpringSpec.N_PER_LBF);
+    }
+
+    private void UpdateReturnText()
+    {
+        decimal v = numReturnTo.Value;
+        btnReturn.Text = v == 0 ? "⟲   RETURN\nTO ZERO" : $"⟲   RETURN\nTO {v:0.##} mm";
+        btnReturn.Invalidate();
+    }
+
+    private void ShowPage(int idx)
+    {
+        for (int i = 0; i < _pages.Length; i++) _pages[i].Visible = i == idx;
+        for (int i = 0; i < _navBtns.Count; i++)
+        {
+            bool on = i == idx;
+            _navBtns[i].Style(on ? CARD_HI : SIDEBAR, on ? CARD_HI : SIDEBAR, on ? INK : TEXT_MID, 0);
+            _navBtns[i].Font = new Font("Segoe UI", 9.5f, on ? FontStyle.Bold : FontStyle.Regular);
+        }
+        _navMarker.Top = 88 + idx * 42;
+    }
+
+    // ── Spring Test page ──────────────────────────────────────────────
+
+    private void BuildTestPage(Panel page)
+    {
+        var cols = Grid(2, 1);
+        cols.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 38));
+        cols.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 62));
+        cols.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        page.Controls.Add(cols);
+
+        // left column
+        var left = Grid(1, 3);
+        left.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        left.RowStyles.Add(new RowStyle(SizeType.Absolute, 180));
+        left.RowStyles.Add(new RowStyle(SizeType.Absolute, 84));
+        left.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        left.Margin = new Padding(0, 0, 14, 0);
+        cols.Controls.Add(left, 0, 0);
+
+        var hero = Card(left, 0, "LOAD", HERO, 14);
+        var unit = Tiny(hero, "lbf");
+        StyleLabel(lblLoad, hero, new Font("Segoe UI Light", 44f), INK, ContentAlignment.MiddleRight);
+        StyleLabel(lblLoadN, hero, new Font("Consolas", 12f), TEXT_MID, ContentAlignment.MiddleRight);
+        StyleLabel(lblMotion, hero, new Font("Segoe UI", 8.5f, FontStyle.Bold), TEXT_DIM, ContentAlignment.MiddleLeft);
+        StyleLabel(lblHz, hero, new Font("Consolas", 8.5f), TEXT_DIM, ContentAlignment.MiddleRight);
+        hero.Resize += (_, _) =>
+        {
+            int w = hero.Width;
+            unit.SetBounds(w - 60, 14, 44, 16);
+            unit.TextAlign = ContentAlignment.MiddleRight;
+            lblLoad.SetBounds(12, 32, w - 28, 72);
+            lblLoadN.SetBounds(12, 104, w - 28, 24);
+            lblMotion.SetBounds(18, 144, w / 2, 20);
+            lblHz.SetBounds(w / 2, 144, w / 2 - 18, 20);
+        };
+
+        var posCard = Card(left, 1, "POSITION  (FROM PRELOAD ZERO)");
+        StyleLabel(lblPos, posCard, new Font("Consolas", 14f), INK, ContentAlignment.MiddleLeft);
+        StyleLabel(lblPosMm, posCard, new Font("Consolas", 10f), TEXT_MID, ContentAlignment.MiddleRight);
+        StyleLabel(lblSpeed, posCard, new Font("Consolas", 8.5f), TEXT_DIM, ContentAlignment.MiddleRight);
+        posCard.Resize += (_, _) =>
+        {
+            int w = posCard.Width;
+            lblPos.SetBounds(14, 34, w / 2, 32);
+            lblPosMm.SetBounds(w / 2, 30, w / 2 - 16, 22);
+            lblSpeed.SetBounds(w / 2, 52, w / 2 - 16, 18);
+        };
+
+        var trend = Card(left, 2, "LOAD TREND  (lbf)");
+        chart.BackColor = CARD;
+        chart.Paint += Chart_Paint;
+        trend.Controls.Add(chart);
+        trend.Resize += (_, _) => chart.SetBounds(12, 34, trend.Width - 24, trend.Height - 46);
+
+        // right column
+        var right = Grid(1, 4);
+        right.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        right.RowStyles.Add(new RowStyle(SizeType.Absolute, 232));
+        right.RowStyles.Add(new RowStyle(SizeType.Absolute, 128));
+        right.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        right.RowStyles.Add(new RowStyle(SizeType.Absolute, 86));
+        cols.Controls.Add(right, 1, 0);
+
+        // spring card
+        var spring = Card(right, 0, "SPRING");
+        spring.Controls.AddRange(new Control[] { btnMain, btnTrim, cboPart, numFree });
+        btnMain.SetBounds(16, 38, 96, 32);
+        btnTrim.SetBounds(118, 38, 96, 32);
+        var freeTag = Tiny(spring, "FREE LENGTH");
+        freeTag.SetBounds(16, 86, 120, 14);
+        numFree.SetBounds(16, 104, 120, 28);
+        var inTag = Tiny(spring, "in");
+        inTag.SetBounds(142, 110, 30, 16);
+        var nomBtn = btnNominal;
+        nomBtn.Style(CARD_HI, BORDER, TEXT_MID);
+        nomBtn.SetBounds(16, 140, 120, 26);
+        nomBtn.Click += (_, _) => { if (SelectedSpec is { } s) numFree.Value = (decimal)s.NominalFreeLengthIn; };
+        spring.Controls.Add(nomBtn);
+        StyleLabel(lblSpec, spring, new Font("Consolas", 9.5f), TEXT_MID, ContentAlignment.TopLeft);
+        spring.Resize += (_, _) =>
+        {
+            int w = spring.Width;
+            cboPart.SetBounds(236, 40, w - 252, 28);
+            lblSpec.SetBounds(236, 82, w - 252, spring.Height - 92);
+        };
+
+        // sequence card
+        var seq = Card(right, 1, "SEQUENCE");
+        seq.Controls.AddRange(new Control[] { btnTare, btnRun });
+        foreach (var b in new[] { btnTare, btnPreload }) { b.Font = new Font("Segoe UI", 10f, FontStyle.Bold); b.Radius = 9; }
+        btnRun.Font = new Font("Segoe UI Semibold", 11f, FontStyle.Bold);
+        btnRun.Radius = 9;
+        StyleLabel(lblHint, seq, new Font("Segoe UI", 8.5f), TEXT_MID, ContentAlignment.MiddleLeft);
+        seq.Resize += (_, _) =>
+        {
+            int w = seq.Width, gap = 10, bw = (w - 32 - gap) / 3;
+            btnTare.SetBounds(16, 38, bw, 46);
+            btnRun.SetBounds(16 + bw + gap, 38, w - 32 - bw - gap, 46);
+            lblHint.SetBounds(16, 92, w - 32, 24);
+        };
+
+        // result card
+        _resultCard = Card(right, 2, "");
+        _resultCard.Radius = 14;
+        StyleLabel(lblResultTag, _resultCard, new Font("Segoe UI", 7.5f, FontStyle.Bold), TEXT_DIM, ContentAlignment.MiddleLeft);
+        lblResultTag.Text = Spaced("RESULT");
+        StyleLabel(lblResult, _resultCard, new Font("Segoe UI Light", 60f), TEXT_MID, ContentAlignment.MiddleCenter);
+        StyleLabel(lblResultDetail, _resultCard, new Font("Consolas", 11f), TEXT_MID, ContentAlignment.TopCenter);
+        _resultCard.Resize += (_, _) =>
+        {
+            int w = _resultCard.Width, h = _resultCard.Height;
+            lblResultTag.SetBounds(16, 12, 200, 16);
+            int detailH = Math.Min(92, Math.Max(60, h / 3));
+            lblResultDetail.SetBounds(12, h - detailH - 12, w - 24, detailH);
+            lblResult.SetBounds(0, 26, w, Math.Max(30, h - detailH - 44));
+            FitResultText();
+        };
+
+        // manual card
+        var man = Card(right, 3, "MANUAL");
+        var manBtns = new[] { btnJogExtFast, btnJogExt, btnJogRet, btnJogRetFast, btnZeroF, btnZeroP };
+        man.Controls.AddRange(manBtns);
+        foreach (var b in manBtns) b.Font = new Font("Segoe UI", 8.5f, FontStyle.Bold);
+        man.Resize += (_, _) =>
+        {
+            int w = man.Width, gap = 6, bw = (w - 32 - gap * 5) / 6;
+            for (int i = 0; i < manBtns.Length; i++) manBtns[i].SetBounds(16 + i * (bw + gap), 36, bw, 36);
+        };
+    }
+
+    // ── Results page ──────────────────────────────────────────────────
+
+    private void BuildResultsPage(Panel page)
+    {
+        var cols = Grid(2, 1);
+        cols.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 62));
+        cols.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 38));
+        cols.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        page.Controls.Add(cols);
+
+        var res = new RoundedPanel { Dock = DockStyle.Fill, Margin = new Padding(0, 0, 14, 0) };
+        cols.Controls.Add(res, 0, 0);
+        var tag = Tiny(res, "RESULTS");
+        tag.SetBounds(16, 16, 120, 16);
+        StyleLabel(lblTally, res, new Font("Consolas", 9f), TEXT_MID, ContentAlignment.MiddleLeft);
+        res.Controls.AddRange(new Control[] { btnExport, btnClear, grid });
+        SetupGrid();
+        res.Resize += (_, _) =>
+        {
+            int w = res.Width;
+            lblTally.SetBounds(130, 12, w - 380, 24);
+            btnExport.SetBounds(w - 232, 10, 120, 30);
+            btnClear.SetBounds(w - 104, 10, 88, 30);
+            grid.SetBounds(12, 50, w - 24, res.Height - 62);
+        };
+
+        var logCard = new RoundedPanel { Dock = DockStyle.Fill, Margin = new Padding(0) };
+        cols.Controls.Add(logCard, 1, 0);
+        var ltag = Tiny(logCard, "EVENT LOG");
+        ltag.SetBounds(16, 16, 200, 16);
+        lstLog.BackColor = CARD;
+        lstLog.ForeColor = TEXT_MID;
+        lstLog.BorderStyle = BorderStyle.None;
+        lstLog.Font = new Font("Consolas", 8.5f);
+        lstLog.IntegralHeight = false;
+        lstLog.HorizontalScrollbar = true;
+        logCard.Controls.Add(lstLog);
+        logCard.Resize += (_, _) => lstLog.SetBounds(12, 42, logCard.Width - 24, logCard.Height - 54);
     }
 
     private void SetupGrid()
     {
-        grid.Dock = DockStyle.Fill;
         grid.ReadOnly = true;
         grid.AllowUserToAddRows = false;
         grid.AllowUserToDeleteRows = false;
@@ -198,31 +491,139 @@ public sealed class MainForm : Form
         grid.RowHeadersVisible = false;
         grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
         grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
-        grid.BackgroundColor = CardBg;
+        grid.BackgroundColor = CARD;
         grid.BorderStyle = BorderStyle.None;
-        grid.GridColor = Line;
+        grid.CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal;
+        grid.GridColor = BORDER;
         grid.EnableHeadersVisualStyles = false;
         grid.ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.None;
-        grid.ColumnHeadersDefaultCellStyle.BackColor = Bg;
-        grid.ColumnHeadersDefaultCellStyle.ForeColor = Muted;
-        grid.ColumnHeadersDefaultCellStyle.SelectionBackColor = Bg;
-        grid.DefaultCellStyle.BackColor = CardBg;
-        grid.DefaultCellStyle.ForeColor = Text1;
-        grid.DefaultCellStyle.SelectionBackColor = Blue;
-        grid.DefaultCellStyle.SelectionForeColor = Color.White;
+        grid.ColumnHeadersHeight = 30;
+        grid.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing;
+        grid.RowTemplate.Height = 28;
+        grid.ColumnHeadersDefaultCellStyle.BackColor = CARD;
+        grid.ColumnHeadersDefaultCellStyle.ForeColor = TEXT_DIM;
+        grid.ColumnHeadersDefaultCellStyle.SelectionBackColor = CARD;
+        grid.ColumnHeadersDefaultCellStyle.Font = new Font("Segoe UI", 7.5f, FontStyle.Bold);
+        grid.DefaultCellStyle.BackColor = CARD;
+        grid.DefaultCellStyle.ForeColor = INK;
+        grid.DefaultCellStyle.Font = new Font("Consolas", 9.5f);
+        grid.DefaultCellStyle.SelectionBackColor = CARD_HI;
+        grid.DefaultCellStyle.SelectionForeColor = INK;
 
-        foreach (var h in new[] { "Time", "Part number", "Free len (in)", "Travel (in)", "Measured (lbf)", "Measured (N)", "Min (lbf)", "Max (lbf)", "Result" })
-            grid.Columns.Add(h.Replace(" ", "").Replace("(", "").Replace(")", ""), h);
+        foreach (var h in new[] { "TIME", "PART NUMBER", "RATE (lb/in)", "NOMINAL", "MIN", "MAX", "DEVIATION", "RESULT" })
+            grid.Columns.Add("c" + grid.Columns.Count, h);
     }
+
+    // ── Setup page ────────────────────────────────────────────────────
+
+    private void BuildSetupPage(Panel page)
+    {
+        var cols = Grid(2, 2);
+        cols.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 440));
+        cols.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 440));
+        cols.RowStyles.Add(new RowStyle(SizeType.Absolute, 300));
+        cols.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        page.Controls.Add(cols);
+
+        // connection
+        var conn = new RoundedPanel { Dock = DockStyle.Fill, Margin = new Padding(0, 0, 14, 0) };
+        cols.Controls.Add(conn, 0, 0);
+        Tiny(conn, "CONNECTION").SetBounds(16, 16, 200, 16);
+        int y = 48;
+        FieldRow(conn, "MODE", cboMode, ref y, 230, 190);
+        FieldRow(conn, "CONTROL PORT   57600", cboPort, ref y, 120, 190);
+        FieldRow(conn, "READINGS PORT   9600", cboPortRead, ref y, 120, 190);
+        btnConnect.Style(ACCENT_FILL, ACCENT_FILL, DARK_TEXT, 0);
+        btnConnect.Font = new Font("Segoe UI Semibold", 9.5f, FontStyle.Bold);
+        btnConnect.SetBounds(16, y + 12, 150, 36);
+        btnDisconnect.Style(CARD_HI, BORDER, TEXT_MID);
+        btnDisconnect.SetBounds(176, y + 12, 130, 36);
+        conn.Controls.AddRange(new Control[] { btnConnect, btnDisconnect });
+
+        // test parameters
+        var par = new RoundedPanel { Dock = DockStyle.Fill, Margin = new Padding(0), AutoScroll = true };
+        cols.Controls.Add(par, 1, 0);
+        cols.SetRowSpan(par, 2);
+        Tiny(par, "TEST PARAMETERS").SetBounds(16, 16, 200, 16);
+        y = 48;
+        FieldRow(par, "PRELOAD   (N)", numPreload, ref y, 130);
+        chkAutoPreload.Location = new Point(16, y + 2);
+        par.Controls.Add(chkAutoPreload);
+        y += 28;
+        chkFromZero.Location = new Point(16, y + 2);
+        par.Controls.Add(chkFromZero);
+        y += 32;
+        FieldRow(par, "MOTION", cboMotion, ref y, 170);
+        FieldRow(par, "MAX SLOW-JOG SPEED   (mm/min)", numMaxSpeed, ref y, 130);
+        FieldRow(par, "SWITCH TO SLOW AT   (mm to go)", numSlowZone, ref y, 130);
+        chkFastTest.Location = new Point(16, y + 2);
+        par.Controls.Add(chkFastTest);
+        y += 36;
+        FieldRow(par, "PRELOAD SPEED   (mm/min)", numApproach, ref y, 130);
+        FieldRow(par, "PRELOAD SETTLE   (s)", numPreloadDwell, ref y, 130);
+        FieldRow(par, "TEST SPEED   (mm/min)", numSpeed, ref y, 130);
+        FieldRow(par, "SETTLE AT LENGTH   (s)", numSettle, ref y, 130);
+        FieldRow(par, "RETURN SPEED   (mm/min)", numReturn, ref y, 130);
+        FieldRow(par, "MAX SEARCH DISTANCE   (mm, 0 = off)", numSearch, ref y, 130);
+        FieldRow(par, "RATE POINT 1   (% of travel)", numP1, ref y, 130);
+        FieldRow(par, "RATE POINT 2   (% of travel)", numP2, ref y, 130);
+        FieldRow(par, "FORCE LIMIT   (N)", numForceLimit, ref y, 130);
+        chkPreloadJog.Location = new Point(16, y + 4);
+        par.Controls.Add(chkPreloadJog);
+        y += 30;
+        chkKeepAlive.Location = new Point(16, y + 4);
+        par.Controls.Add(chkKeepAlive);
+        y += 30;
+        chkZeroForceAtPreload.Location = new Point(16, y + 8);
+        par.Controls.Add(chkZeroForceAtPreload);
+        var note = new Label
+        {
+            Text = "ZERO tares force with the spring hanging free (optional). FIND PRELOAD drives up or down\n" +
+                   "to the preload, settles, and zeros position; RUN TEST moves (test length − free length).\n" +
+                   "Drive stage runs at the speeds above; slow jog (fallback) ignores them.",
+            ForeColor = TEXT_DIM, BackColor = CARD, Font = new Font("Segoe UI", 8.5f),
+            Location = new Point(16, y + 44), AutoSize = true,
+        };
+        par.Controls.Add(note);
+
+        foreach (Control c in par.Controls)
+            if (c is not Label) _lockables.Add(c);
+        btnLock.Font = new Font("Segoe UI", 8.5f, FontStyle.Bold);
+        par.Controls.Add(btnLock);
+        par.Resize += (_, _) => btnLock.SetBounds(par.Width - 146, 10, 130, 30);
+        btnLock.Click += (_, _) => ToggleLock();
+    }
+
+    private static void FieldRow(RoundedPanel card, string label, Control input, ref int y, int inputWidth, int inputX = 250)
+    {
+        var l = new Label
+        {
+            Text = Spaced(label), ForeColor = TEXT_DIM, BackColor = CARD, Font = new Font("Segoe UI", 7.5f, FontStyle.Bold),
+            TextAlign = ContentAlignment.MiddleLeft,
+        };
+        l.SetBounds(16, y, inputX - 20, 28);
+        input.SetBounds(inputX, y, inputWidth, 28);
+        card.Controls.Add(l);
+        card.Controls.Add(input);
+        y += 40;
+    }
+
+    // ═════════════════════════════ events ═════════════════════════════
 
     private void WireEvents()
     {
-        btnConnect.Click += async (_, _) => await ConnectToggleAsync();
+        btnConnect.Click += async (_, _) => await ConnectAsync();
+        btnDisconnect.Click += async (_, _) => await DisconnectAsync();
         cboMode.SelectedIndexChanged += (_, _) => UpdateEnables();
-        rbMain.CheckedChanged += (_, _) => { if (rbMain.Checked) PopulateParts(); };
-        rbTrim.CheckedChanged += (_, _) => { if (rbTrim.Checked) PopulateParts(); };
+
+        btnMain.Click += (_, _) => SelectFamily(SpringFamily.Main);
+        btnTrim.Click += (_, _) => SelectFamily(SpringFamily.Trim);
         cboPart.SelectedIndexChanged += (_, _) => OnSpecChanged();
         numFree.ValueChanged += (_, _) => UpdateSpecLabel();
+        numP1.ValueChanged += (_, _) => UpdateSpecLabel();
+        numPreload.ValueChanged += (_, _) => UpdateSpecLabel();
+        chkAutoPreload.CheckedChanged += (_, _) => UpdateSpecLabel();
+        numP2.ValueChanged += (_, _) => UpdateSpecLabel();
 
         btnTare.Click += async (_, _) => await TareAsync();
         btnPreload.Click += async (_, _) => await PreloadAsync();
@@ -230,26 +631,27 @@ public sealed class MainForm : Form
 
         btnZeroF.Click += async (_, _) => { if (_ctl != null) { await _ctl.TareForceAsync(); ResetSteps(); } };
         btnZeroP.Click += async (_, _) => { if (_ctl != null) { await _ctl.ZeroPositionAsync(); _preloaded = false; UpdateEnables(); } };
-        btnHome.Click += async (_, _) => { if (_ctl != null) await _ctl.HomeAsync(); };
-        HookJog(btnJogExt, JogDirection.Extend);
-        HookJog(btnJogRet, JogDirection.Retract);
+        HookJog(btnJogExt, JogDirection.Extend, false);
+        HookJog(btnJogRet, JogDirection.Retract, false);
+        HookJog(btnJogExtFast, JogDirection.Extend, true);
+        HookJog(btnJogRetFast, JogDirection.Retract, true);
 
         btnStop.Click += async (_, _) => await StopAsync();
         btnReturn.Click += async (_, _) => await ReturnAsync();
 
         btnExport.Click += (_, _) => ExportCsv();
-        btnClear.Click += (_, _) => { _results.Clear(); grid.Rows.Clear(); };
+        btnClear.Click += (_, _) => { _results.Clear(); grid.Rows.Clear(); UpdateTally(); };
 
         FormClosing += OnFormClosing;
     }
 
-    private void HookJog(Button b, JogDirection dir)
+    private void HookJog(Button b, JogDirection dir, bool fast)
     {
         b.MouseDown += (_, e) =>
         {
             if (e.Button != MouseButtons.Left || _ctl == null) return;
             PullSettings();
-            _ = _ctl.JogAsync(dir);
+            _ = _ctl.JogAsync(dir, fast);
         };
         b.MouseUp += (_, _) => _ = _ctl?.JogReleaseAsync();
         b.MouseLeave += (_, _) => _ = _ctl?.JogReleaseAsync();
@@ -265,37 +667,29 @@ public sealed class MainForm : Form
 
     // ═════════════════════════════ actions ═════════════════════════════
 
-    private async Task ConnectToggleAsync()
+    private async Task ConnectAsync()
     {
+        if (_ctl != null) return;
         try
         {
-            if (_ctl != null)
-            {
-                var old = _ctl;
-                _ctl = null;
-                await old.DisconnectAsync();
-                old.Dispose();
-                _machine = null;
-                btnConnect.Text = "Connect";
-                lblForce.Text = lblPos.Text = lblState.Text = "—";
-                ResetSteps();
-                return;
-            }
-
-            _machine = cboMode.SelectedIndex == 1 ? new LsSerialMachine(cboPort.Text) : new SimulatedLsMachine();
+            _machine = cboMode.SelectedIndex == 1
+                ? new LsSerialMachine(cboPort.Text, cboPortRead.Text)
+                : new SimulatedLsMachine();
             if (_machine is SimulatedLsMachine sim && SelectedSpec is { } spec) sim.LoadSpring(spec);
 
             PullSettings();
             var ctl = new MachineController(_machine, _settings);
-            ctl.ReadingUpdated += r => Ui(() => ShowReading(r));
             ctl.StatusChanged += m => Ui(() => SetStatus(m));
             ctl.BusyChanged += _ => Ui(UpdateEnables);
+            SetStatus("Connecting…");
             await ctl.ConnectAsync();
 
             _ctl = ctl;
-            btnConnect.Text = "Disconnect";
             ResetSteps();
-            SetStatus(cboMode.SelectedIndex == 1 ? $"Connected on {cboPort.Text}." : "Simulator connected.");
+            SetStatus(cboMode.SelectedIndex == 1
+                ? $"LS1+ connected — control {cboPort.Text}, readings {cboPortRead.Text}."
+                : "Simulator connected.");
+            ShowPage(0);
         }
         catch (Exception ex)
         {
@@ -310,10 +704,22 @@ public sealed class MainForm : Form
         }
     }
 
+    private async Task DisconnectAsync()
+    {
+        var old = _ctl;
+        if (old == null) return;
+        _ctl = null;
+        try { await old.DisconnectAsync(); } catch { }
+        old.Dispose();
+        _machine = null;
+        ResetSteps();
+        UpdateEnables();
+    }
+
     private async Task TareAsync()
     {
         if (_ctl == null) return;
-        if (await _ctl.TareForceAsync()) { _tared = true; _preloaded = false; }
+        if (await _ctl.ZeroAllAsync()) { _tared = true; _preloaded = false; }
         UpdateEnables();
     }
 
@@ -330,13 +736,14 @@ public sealed class MainForm : Form
         if (_ctl == null || SelectedSpec is not { } spec) return;
         PullSettings();
         ShowRunning(spec);
-        var r = await _ctl.RunTestAsync(spec, (double)numFree.Value);
+        var r = await _ctl.RunSequenceAsync(spec, (double)numFree.Value);
         if (r is null)
         {
-            ResetResultPanel("Test aborted — see status bar");
+            ShowIdle("Test aborted — see event log");
         }
         else
         {
+            _lastResult = r;
             ShowResult(r);
             _results.Add(r);
             AddGridRow(r);
@@ -360,6 +767,7 @@ public sealed class MainForm : Form
 
     private void OnFormClosing(object? sender, FormClosingEventArgs e)
     {
+        _uiTimer.Stop();
         var ctl = _ctl;
         _ctl = null;
         if (ctl == null) return;
@@ -370,19 +778,29 @@ public sealed class MainForm : Form
 
     private SpringSpec? SelectedSpec => cboPart.SelectedItem as SpringSpec;
 
-    private void PopulateParts()
+    private void SelectFamily(SpringFamily fam)
     {
-        var list = rbMain.Checked ? SpringSpecs.Main : SpringSpecs.Trim;
+        _family = fam;
+        StyleToggle(btnMain, fam == SpringFamily.Main);
+        StyleToggle(btnTrim, fam == SpringFamily.Trim);
+
+        var list = fam == SpringFamily.Main ? SpringSpecs.Main : SpringSpecs.Trim;
         cboPart.BeginUpdate();
         cboPart.Items.Clear();
         int defaultIdx = 0;
         for (int i = 0; i < list.Count; i++)
         {
             cboPart.Items.Add(list[i]);
-            if (rbMain.Checked && list[i].PartNumber.EndsWith("-11")) defaultIdx = i;
+            if (fam == SpringFamily.Main && list[i].PartNumber.EndsWith("-11")) defaultIdx = i;
         }
         cboPart.EndUpdate();
         cboPart.SelectedIndex = defaultIdx;
+    }
+
+    private static void StyleToggle(RoundedButton b, bool on)
+    {
+        if (on) b.Style(ACCENT_FILL, ACCENT_FILL, DARK_TEXT, 0);
+        else b.Style(CARD_HI, BORDER, TEXT_MID);
     }
 
     private void OnSpecChanged()
@@ -392,73 +810,200 @@ public sealed class MainForm : Form
         UpdateSpecLabel();
         if (_machine is SimulatedLsMachine sim && !(_ctl?.IsBusy ?? false)) sim.LoadSpring(s);
         ResetSteps();
-        ResetResultPanel($"{s.PartNumber} selected — hang spring, then Tare force");
+        _lastResult = null;
+        ShowIdle($"{s.PartNumber} selected — hang the spring free, then TARE");
+        chart.Invalidate();
     }
 
     private void UpdateSpecLabel()
     {
         if (SelectedSpec is not { } s) { lblSpec.Text = ""; return; }
-        double free = (double)numFree.Value;
-        double travel = s.TestLengthIn - free;
-        double nMin = s.LoadMinLbf * SpringSpec.N_PER_LBF, nMax = s.LoadMaxLbf * SpringSpec.N_PER_LBF;
+        double travel = s.TestLengthIn - (double)numFree.Value;
         lblSpec.Text =
-            $"Test length:  {s.TestLengthIn:0.00} in    (nominal free {s.NominalFreeLengthIn:0.00} in)\n" +
-            $"Travel from preload:  {travel:0.000} in\n" +
-            $"Load spec:  {s.LoadNomLbf:0.000} ± {s.LoadTolLbf:0.000} lbf\n" +
-            $"   pass band  {s.LoadMinLbf:0.000} – {s.LoadMaxLbf:0.000} lbf   ({nMin:0.000} – {nMax:0.000} N)\n" +
-            $"Rate:  {s.RateLbPerIn:0.000} ± {s.RateTolLbPerIn:0.000} lb/in      Color:  {s.ColorText}";
+            $"RATE SPEC     {s.RateLbPerIn:0.000} ± {s.RateTolLbPerIn:0.000} lb/in\n" +
+            $"PASS BAND     {s.RateMinLbPerIn:0.000} – {s.RateMaxLbPerIn:0.000} lb/in\n" +
+            $"RATE POINTS   {travel * (double)numP1.Value / 100:0.000} / {travel * (double)numP2.Value / 100:0.000} in from preload  ({numP1.Value:0}% / {numP2.Value:0}%)\n" +
+            $"TRAVEL        {travel:0.000} in   ({travel * 25.4:0.00} mm) from preload\n" +
+            $"PRELOAD       {PreloadPreviewN(s):0.000} N  ({PreloadPreviewN(s) * SpringSpec.N_TO_LBS:0.000} lbf){(chkAutoPreload.Checked ? "  auto" : "")}\n" +
+            $"COLOR         {s.ColorText}";
     }
 
     // ═════════════════════════════ display ═════════════════════════════
 
-    private void ShowReading(MachineReading r)
+    private void UiTick()
     {
-        lblForce.Text = $"{r.ForceN:0.000} N\n{r.ForceN * SpringSpec.N_TO_LBS:0.0000} lbf";
-        lblPos.Text = $"{r.PositionIn:0.0000} in\n{r.PositionIn * 25.4:0.000} mm";
-        lblState.Text = (r.IsMoving ? "MOVING" : "IDLE") + "\n" + (_ctl?.ActiveOperation ?? "—");
-        lblState.ForeColor = r.IsMoving ? Amber : Text1;
+        bool online = _ctl != null;
+        lblConn.Text = online ? (_machine is SimulatedLsMachine ? "● SIMULATOR" : "● LS1+  ONLINE") : "● LS1+  OFFLINE";
+        lblConn.ForeColor = online ? GOOD : TEXT_DIM;
+        if (_ctl == null) return;
+
+        var r = _ctl.Latest;
+        double lbf = r.ForceN * SpringSpec.N_TO_LBS;
+        lblLoad.Text = $"{lbf:0.0000}";
+        lblLoadN.Text = $"{r.ForceN:0.0000} N";
+        lblPos.Text = $"{r.PositionIn:0.0000} in";
+        lblPosMm.Text = $"{r.PositionIn * 25.4:0.000} mm";
+        _speedSamples.Enqueue((r.Time, r.PositionIn));
+        while (_speedSamples.Count > 2 && (r.Time - _speedSamples.Peek().t).TotalSeconds > 1.0) _speedSamples.Dequeue();
+        var s0 = _speedSamples.Peek();
+        double sdt = (r.Time - s0.t).TotalSeconds;
+        lblSpeed.Text = sdt > 0.3 ? $"{Math.Abs(r.PositionIn - s0.p) / sdt * 60 * 25.4:0.0} mm/min" : "";
+
+        string? op = _ctl.ActiveOperation;
+        if (op != null) { lblMotion.Text = "● " + op.ToUpperInvariant(); lblMotion.ForeColor = AMBER; }
+        else if (r.IsMoving) { lblMotion.Text = "● MOVING"; lblMotion.ForeColor = AMBER; }
+        else { lblMotion.Text = "● STOPPED"; lblMotion.ForeColor = TEXT_DIM; }
+        lblHz.Text = $"{_ctl.ReadingsHz:0} Hz";
+
+        // colour the hero value against the pass band while a test is in progress
+        var spec = SelectedSpec;
+        lblLoad.ForeColor = op != null ? AMBER : INK;
+
+        _loadHistory.Enqueue(lbf);
+        while (_loadHistory.Count > CHART_POINTS) _loadHistory.Dequeue();
+        chart.Invalidate();
     }
 
-    private void ResetResultPanel(string detail)
+    private void Chart_Paint(object? sender, PaintEventArgs e)
     {
-        _resultPanel.BackColor = Neutral;
+        var g = e.Graphics;
+        int w = chart.Width, h = chart.Height;
+        g.Clear(CARD);
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+
+        using var gridPen = new Pen(Color.FromArgb(42, 45, 52), 1);
+        for (int i = 1; i < 4; i++) { int gy = h * i / 4; g.DrawLine(gridPen, 0, gy, w, gy); }
+        for (int i = 1; i < 6; i++) { int gx = w * i / 6; g.DrawLine(gridPen, gx, 0, gx, h); }
+        if (_loadHistory.Count < 2 || h < 20) return;
+
+        var pts = _loadHistory.ToArray();
+        double min = Math.Min(0, pts.Min()), max = pts.Max();
+        var spec = SelectedSpec;
+        bool showBand = false;   // pass/fail is on rate, not on a load band
+        if (showBand) max = Math.Max(max, spec!.LoadMaxLbf * 1.08);
+        if (max - min < 0.001) max = min + 0.001;
+        float Y(double v) => h - (float)((v - min) / (max - min) * (h - 8)) - 4;
+
+        if (showBand)
+        {
+            float y1 = Y(spec!.LoadMaxLbf), y2 = Y(spec.LoadMinLbf);
+            using var band = new SolidBrush(Color.FromArgb(28, GOOD));
+            g.FillRectangle(band, 0, y1, w, y2 - y1);
+            using var bandPen = new Pen(Color.FromArgb(90, GOOD), 1) { DashStyle = DashStyle.Dash };
+            g.DrawLine(bandPen, 0, y1, w, y1);
+            g.DrawLine(bandPen, 0, y2, w, y2);
+        }
+
+        using (var font = new Font("Consolas", 7f))
+        using (var brush = new SolidBrush(TEXT_DIM))
+        {
+            for (int i = 1; i < 4; i++)
+            {
+                double val = min + (max - min) * i / 4.0;
+                g.DrawString($"{val:0.000}", font, brush, 3, Y(val) - 12);
+            }
+        }
+
+        float xStep = (float)w / (CHART_POINTS - 1);
+        var points = new PointF[pts.Length];
+        for (int i = 0; i < pts.Length; i++)
+            points[i] = new PointF((i + CHART_POINTS - pts.Length) * xStep, Y(pts[i]));
+        using var linePen = new Pen(Color.FromArgb(210, 214, 220), 1.6f);
+        g.DrawLines(linePen, points);
+        var last = points[^1];
+        using var dot = new SolidBrush(WHITE);
+        g.FillEllipse(dot, last.X - 3, last.Y - 3, 6, 6);
+    }
+
+    /// <summary>Shrink the big PASS/FAIL text and the detail text until they fit their boxes.</summary>
+    private void FitResultText()
+    {
+        FitLabel(lblResult, "Segoe UI Light", 60f, 14f, FontStyle.Regular);
+        FitLabel(lblResultDetail, "Consolas", 11f, 7f, FontStyle.Regular);
+    }
+
+    private static void FitLabel(Label l, string family, float maxPt, float minPt, FontStyle style)
+    {
+        if (l.Width < 10 || l.Height < 10) return;
+        var box = new Size(l.Width - 8, l.Height - 4);
+        for (float pt = maxPt; pt >= minPt; pt -= 1f)
+        {
+            using var f = new Font(family, pt, style);
+            var sz = TextRenderer.MeasureText(string.IsNullOrEmpty(l.Text) ? "X" : l.Text, f,
+                                              new Size(int.MaxValue, int.MaxValue), TextFormatFlags.NoPadding);
+            if ((sz.Width <= box.Width && sz.Height <= box.Height) || pt <= minPt)
+            {
+                if (l.Font.Size != pt || l.Font.FontFamily.Name != family) l.Font = new Font(family, pt, style);
+                return;
+            }
+        }
+    }
+
+    private void ShowIdle(string detail)
+    {
+        _resultCard.SetColors(CARD, BORDER);
         lblResult.Text = "READY";
+        lblResult.ForeColor = TEXT_MID;
         lblResultDetail.Text = detail;
+        lblResultDetail.ForeColor = TEXT_MID;
+        FitResultText();
     }
 
     private void ShowRunning(SpringSpec s)
     {
-        _resultPanel.BackColor = Blue;
-        lblResult.Text = "TESTING…";
-        lblResultDetail.Text = $"{s.PartNumber} — driving to {s.TestLengthIn:0.00} in, then settling";
+        _resultCard.SetColors(CARD_HI, BORDER_HI);
+        lblResult.Text = "TESTING";
+        lblResult.ForeColor = INK;
+        double tr = s.TestLengthIn - (double)numFree.Value;
+        lblResultDetail.Text = $"{s.PartNumber}  →  2 points: {tr * (double)numP1.Value / 100:0.000} / {tr * (double)numP2.Value / 100:0.000} in from preload";
+        lblResultDetail.ForeColor = TEXT_MID;
+        FitResultText();
     }
 
     private void ShowResult(TestResult r)
     {
-        _resultPanel.BackColor = r.Pass ? Green : Red;
-        string dirn = r.Pass ? "" : (r.MeasuredLbf < r.Spec.LoadMinLbf ? "   (LOW)" : "   (HIGH)");
+        var fg = r.Pass ? GOOD : FAULT;
+        _resultCard.SetColors(r.Pass ? GOOD_FILL : FAULT_FILL, r.Pass ? GOOD_EDGE : FAULT_EDGE);
         lblResult.Text = r.Pass ? "PASS" : "FAIL";
-        lblResultDetail.Text =
-            $"{r.Spec.PartNumber}    {r.MeasuredLbf:0.000} lbf  ({r.MeasuredN:0.000} N){dirn}\n" +
-            $"spec {r.Spec.LoadMinLbf:0.000} – {r.Spec.LoadMaxLbf:0.000} lbf at {r.Spec.TestLengthIn:0.00} in";
+        lblResult.ForeColor = fg;
+        string text;
+        if (r.RateLbPerIn is double rate)
+        {
+            string tag = r.RatePass == true ? "✓" : (rate < r.Spec.RateMinLbPerIn ? "✗ LOW" : "✗ HIGH");
+            double dev = (rate - r.Spec.RateLbPerIn) / r.Spec.RateLbPerIn * 100.0;
+            text = $"{r.Spec.PartNumber}\n" +
+                   $"RATE  {rate:0.000} lb/in  {tag}   ({dev:+0.0;-0.0}% of nominal {r.Spec.RateLbPerIn:0.000})\n" +
+                   $"spec {r.Spec.RateMinLbPerIn:0.000} – {r.Spec.RateMaxLbPerIn:0.000} lb/in";
+        }
+        else text = $"{r.Spec.PartNumber}\nRate could not be computed";
+        if (r.Points is { Count: > 1 } pts)
+            text += "\n" + string.Join("    ", pts.Select((p, k) => $"{k + 1}: {p.ForceLbf:0.000} lbf @ {p.PositionIn:0.000} in"));
+        lblResultDetail.Text = text;
+        lblResultDetail.ForeColor = Blend(fg, INK, 0.4f);
+        FitResultText();
     }
 
     private void AddGridRow(TestResult r)
     {
+        var sp = r.Spec;
+        string rateVal = r.RateLbPerIn is double rv ? rv.ToString("0.000") : "—";
+        string dev = r.RateLbPerIn is double rd ? $"{(rd - sp.RateLbPerIn) / sp.RateLbPerIn * 100:+0.0;-0.0} %" : "—";
         int i = grid.Rows.Add(
-            r.Time.ToString("HH:mm:ss"),
-            r.Spec.PartNumber,
-            r.FreeLengthIn.ToString("0.000"),
-            r.TravelIn.ToString("0.000"),
-            r.MeasuredLbf.ToString("0.000"),
-            r.MeasuredN.ToString("0.000"),
-            r.Spec.LoadMinLbf.ToString("0.000"),
-            r.Spec.LoadMaxLbf.ToString("0.000"),
-            r.Pass ? "PASS" : "FAIL");
+            r.Time.ToString("HH:mm:ss"), sp.PartNumber, rateVal,
+            sp.RateLbPerIn.ToString("0.000"), sp.RateMinLbPerIn.ToString("0.000"), sp.RateMaxLbPerIn.ToString("0.000"),
+            dev, r.Pass ? "PASS" : "FAIL");
         var cell = grid.Rows[i].Cells[grid.Columns.Count - 1];
-        cell.Style.ForeColor = r.Pass ? Green : Red;
-        cell.Style.Font = new Font(grid.Font, FontStyle.Bold);
+        cell.Style.ForeColor = r.Pass ? GOOD : FAULT;
+        cell.Style.Font = new Font("Consolas", 9.5f, FontStyle.Bold);
+        grid.Rows[i].Cells[2].Style.ForeColor = r.Pass ? GOOD : FAULT;
         try { grid.FirstDisplayedScrollingRowIndex = i; } catch (InvalidOperationException) { }
+        UpdateTally();
+    }
+
+    private void UpdateTally()
+    {
+        int pass = _results.Count(r => r.Pass);
+        lblTally.Text = _results.Count == 0 ? "" : $"{_results.Count} tested   ·   {pass} pass   ·   {_results.Count - pass} fail";
     }
 
     private void UpdateEnables()
@@ -466,24 +1011,43 @@ public sealed class MainForm : Form
         bool conn = _ctl != null;
         bool busy = _ctl?.IsBusy ?? false;
 
-        btnConnect.Enabled = !busy;
+        btnConnect.Enabled = !conn;
+        btnDisconnect.Enabled = conn && !busy;
         cboMode.Enabled = !conn;
-        cboPort.Enabled = !conn && cboMode.SelectedIndex == 1;
+        cboPort.Enabled = cboPortRead.Enabled = !conn && cboMode.SelectedIndex == 1;
 
-        rbMain.Enabled = rbTrim.Enabled = cboPart.Enabled = numFree.Enabled = !busy;
+        btnMain.Enabled = btnTrim.Enabled = cboPart.Enabled = !busy;
+        numFree.Enabled = btnNominal.Enabled = !busy && _unlocked;
+        foreach (var c in _lockables) c.Enabled = _unlocked;
+        btnLock.Text = _unlocked ? "🔓  LOCK" : "🔒  UNLOCK";
+        btnLock.Style(_unlocked ? AMBER : CARD_HI, _unlocked ? AMBER : BORDER, _unlocked ? DARK_TEXT : TEXT_MID, _unlocked ? 0 : 1);
 
         btnTare.Enabled = conn && !busy;
-        btnPreload.Enabled = conn && !busy && _tared;
-        btnRun.Enabled = conn && !busy && _preloaded;
-        btnTare.Text = (_tared ? "✓  " : "1.  ") + "Tare force  (spring hanging free)";
-        btnPreload.Text = (_preloaded ? "✓  " : "2.  ") + "Find preload + zero position";
+        btnPreload.Enabled = conn && !busy;
+        btnRun.Enabled = conn && !busy;
+        StyleStep(btnTare, "1   ZERO", _tared, conn && !busy && !_tared);
+        StyleStep(btnRun, "2   RUN TEST   (preload → 2 points → rate)", false, conn && !busy && _tared);
 
-        btnZeroF.Enabled = btnZeroP.Enabled = btnHome.Enabled = conn && !busy;
+        lblHint.Text = !conn ? "Not connected — go to Setup and connect."
+            : busy ? $"{_ctl!.ActiveOperation}…   (Esc or STOP to abort)"
+            : !_tared ? "With the spring slack (lower hook loose), press ZERO — that's the start position. Then RUN TEST."
+            : "RUN TEST: back to zero → up to preload → zero → 20% / 60% points → rate.";
+
+        btnZeroF.Enabled = btnZeroP.Enabled = conn && !busy;
 
         // Never disabled while busy: jog buttons must always receive MouseUp,
         // STOP and RETURN must always be available.
-        btnJogExt.Enabled = btnJogRet.Enabled = conn;
+        btnJogExt.Enabled = btnJogRet.Enabled = btnJogExtFast.Enabled = btnJogRetFast.Enabled = conn;
         btnStop.Enabled = btnReturn.Enabled = conn;
+    }
+
+    /// <summary>Done steps get a check and sage tint; the next step is the white primary pill.</summary>
+    private static void StyleStep(RoundedButton b, string text, bool done, bool next)
+    {
+        b.Text = done ? "✓   " + text.Substring(4) : text;
+        if (done) b.Style(GOOD_FILL, GOOD_EDGE, GOOD);
+        else if (next) b.Style(ACCENT_FILL, ACCENT_FILL, DARK_TEXT, 0);
+        else b.Style(CARD_HI, BORDER, TEXT_MID);
     }
 
     private void ResetSteps()
@@ -496,20 +1060,47 @@ public sealed class MainForm : Form
     private void PullSettings()
     {
         _settings.PreloadN = (double)numPreload.Value;
-        _settings.TestSpeedInPerMin = (double)numSpeed.Value;
+        _settings.AutoPreload = chkAutoPreload.Checked;
+        _settings.PreloadFromZero = chkFromZero.Checked;
+        _settings.ApproachSpeedInPerMin = (double)numApproach.Value / TestSettings.MM_PER_IN;
+        _settings.PreloadDwellSeconds = (double)numPreloadDwell.Value;
+        _settings.TestSpeedInPerMin = (double)numSpeed.Value / TestSettings.MM_PER_IN;
         _settings.SettleSeconds = (double)numSettle.Value;
+        _settings.ReturnFastMmMin = (double)numReturn.Value;
+        _settings.ReturnTargetMm = (double)numReturnTo.Value;
+        _settings.MaxPreloadSearchIn = (double)numSearch.Value / TestSettings.MM_PER_IN;
+        _settings.RatePoint1Pct = (double)Math.Min(numP1.Value, numP2.Value - 5);
+        _settings.RatePoint2Pct = (double)numP2.Value;
         _settings.ForceLimitN = (double)numForceLimit.Value;
         _settings.ZeroForceAtPreload = chkZeroForceAtPreload.Checked;
+        _settings.UseJogMotion = cboMotion.SelectedIndex == 0;
+        _settings.MaxAutoSpeedMmMin = (double)numMaxSpeed.Value;
+        _settings.FastApproachZoneIn = (double)numSlowZone.Value / TestSettings.MM_PER_IN;
+        _settings.TestFastApproach = chkFastTest.Checked;
+        _settings.MeasureRate = true;
+        _settings.PreloadUseJog = chkPreloadJog.Checked;
+        if (_machine != null) _machine.KeepAliveDrives = chkKeepAlive.Checked;
     }
 
     private void PopulatePorts()
     {
-        cboPort.Items.Clear();
-        foreach (var p in SerialPort.GetPortNames().OrderBy(p => p)) cboPort.Items.Add(p);
-        if (cboPort.Items.Count > 0) cboPort.SelectedIndex = 0;
+        var ports = SerialPort.GetPortNames().Union(new[] { "COM4", "COM5" }).Distinct().OrderBy(p => p).ToArray();
+        foreach (var cb in new[] { cboPort, cboPortRead })
+        {
+            cb.Items.Clear();
+            foreach (var p in ports) cb.Items.Add(p);
+        }
+        cboPort.SelectedItem = "COM5";       // LS1+ control, as in the AQM app
+        cboPortRead.SelectedItem = "COM4";   // LS1+ readings stream
     }
 
-    private void SetStatus(string msg) => lblStatus.Text = $"{DateTime.Now:HH:mm:ss}   {msg}";
+    private void SetStatus(string msg)
+    {
+        lstLog.Items.Add($"{DateTime.Now:HH:mm:ss.f}   {msg}");
+        while (lstLog.Items.Count > 500) lstLog.Items.RemoveAt(0);
+        lstLog.TopIndex = Math.Max(0, lstLog.Items.Count - 1);
+        if (!msg.StartsWith("TX ") && !msg.StartsWith("SIM ")) lblHint.Text = msg;
+    }
 
     private void ExportCsv()
     {
@@ -523,20 +1114,20 @@ public sealed class MainForm : Form
 
         var ci = CultureInfo.InvariantCulture;
         var sb = new StringBuilder();
-        sb.AppendLine("Time,PartNumber,Family,FreeLength_in,Travel_in,Measured_lbf,Measured_N,Min_lbf,Max_lbf,Result");
+        sb.AppendLine("Time,PartNumber,Family,FreeLength_in,Rate_lb_per_in,RateNominal,RateMin,RateMax,Deviation_pct,Result," +
+                      "Point1_in,Point1_lbf,Point2_in,Point2_lbf");
         foreach (var r in _results)
         {
+            var sp = r.Spec;
+            string rate = r.RateLbPerIn?.ToString("0.0000", ci) ?? "";
+            string dev = r.RateLbPerIn is double rd ? ((rd - sp.RateLbPerIn) / sp.RateLbPerIn * 100).ToString("0.00", ci) : "";
+            string steps = string.Join(",", Enumerable.Range(0, 2).Select(k => r.Points != null && k < r.Points.Count
+                ? $"{r.Points[k].PositionIn.ToString("0.0000", ci)},{r.Points[k].ForceLbf.ToString("0.0000", ci)}" : ","));
             sb.AppendLine(string.Join(",",
-                r.Time.ToString("yyyy-MM-dd HH:mm:ss", ci),
-                r.Spec.PartNumber,
-                r.Spec.Family.ToString(),
-                r.FreeLengthIn.ToString("0.000", ci),
-                r.TravelIn.ToString("0.000", ci),
-                r.MeasuredLbf.ToString("0.0000", ci),
-                r.MeasuredN.ToString("0.0000", ci),
-                r.Spec.LoadMinLbf.ToString("0.000", ci),
-                r.Spec.LoadMaxLbf.ToString("0.000", ci),
-                r.Pass ? "PASS" : "FAIL"));
+                r.Time.ToString("yyyy-MM-dd HH:mm:ss", ci), sp.PartNumber, sp.Family.ToString(),
+                r.FreeLengthIn.ToString("0.000", ci), rate,
+                sp.RateLbPerIn.ToString("0.000", ci), sp.RateMinLbPerIn.ToString("0.000", ci), sp.RateMaxLbPerIn.ToString("0.000", ci),
+                dev, r.Pass ? "PASS" : "FAIL", steps));
         }
         try
         {
@@ -553,127 +1144,65 @@ public sealed class MainForm : Form
     {
         if (IsDisposed || Disposing) return;
         if (!InvokeRequired) { a(); return; }
-        try { BeginInvoke(a); } catch (InvalidOperationException) { } 
+        try { BeginInvoke(a); } catch (InvalidOperationException) { }   // also covers ObjectDisposedException
     }
 
-    // ═════════════════════════════ control factories ═════════════════════════════
+    // ═════════════════════════════ factories ═════════════════════════════
 
-    private static TableLayoutPanel Card(string title)
+    private static TableLayoutPanel Grid(int cols, int rows) => new()
     {
-        var t = new TableLayoutPanel
-        {
-            ColumnCount = 2,
-            AutoSize = true,
-            AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            BackColor = CardBg,
-            Padding = new Padding(12, 10, 12, 12),
-            Margin = new Padding(0, 0, 0, 10),
-            MinimumSize = new Size(CardWidth, 0),
-            MaximumSize = new Size(CardWidth, 0),
-        };
-        t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
-        t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
-        AddRow(t, new Label
-        {
-            Text = title,
-            ForeColor = Blue,
-            Font = new Font("Segoe UI", 9f, FontStyle.Bold),
-            AutoSize = true,
-            Margin = new Padding(3, 0, 3, 6),
-        });
-        return t;
-    }
-
-    private static void AddRow(TableLayoutPanel t, Control a, Control? b = null)
-    {
-        // Inside auto-size rows, anchor (not dock) so each control keeps its own height.
-        foreach (var c in new[] { a, b })
-        {
-            if (c is null or Label) continue;
-            c.Dock = DockStyle.None;
-            c.Anchor = AnchorStyles.Left | AnchorStyles.Right;
-        }
-        int row = t.RowCount;
-        t.RowCount = row + 1;
-        t.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        t.Controls.Add(a, 0, row);
-        if (b == null) t.SetColumnSpan(a, 2);
-        else t.Controls.Add(b, 1, row);
-    }
-
-    private static Control Readout(string title, Label value)
-    {
-        var p = new Panel { Dock = DockStyle.Fill, BackColor = CardBg, Margin = new Padding(0, 0, 10, 0), Padding = new Padding(14, 8, 14, 8) };
-        var t = new Label { Text = title, Dock = DockStyle.Top, Height = 22, ForeColor = Muted, Font = new Font("Segoe UI", 8.5f, FontStyle.Bold) };
-        value.Dock = DockStyle.Fill;
-        value.ForeColor = Text1;
-        value.Font = new Font("Consolas", 18f, FontStyle.Bold);
-        value.TextAlign = ContentAlignment.MiddleLeft;
-        p.Controls.Add(t);
-        p.Controls.Add(value);
-        value.BringToFront();
-        return p;
-    }
-
-    private static Label Lbl(string text) => new()
-    {
-        Text = text,
-        AutoSize = true,
-        ForeColor = Muted,
-        Anchor = AnchorStyles.Left,
-        Margin = new Padding(3, 8, 3, 3),
+        Dock = DockStyle.Fill, ColumnCount = cols, RowCount = rows, BackColor = BG, Margin = new Padding(0), Padding = new Padding(0),
     };
 
-    private static Button Btn(string text, Color back, float size = 10f, bool bold = false)
+    private static RoundedPanel Card(TableLayoutPanel parent, int row, string title, Color? fill = null, int radius = 12)
     {
-        var b = new Button
-        {
-            Text = text,
-            BackColor = back,
-            ForeColor = Color.White,
-            FlatStyle = FlatStyle.Flat,
-            Font = new Font("Segoe UI", size, bold ? FontStyle.Bold : FontStyle.Regular),
-            Dock = DockStyle.Fill,
-            Height = size > 11 ? 48 : 38,
-            Margin = new Padding(3),
-            UseVisualStyleBackColor = false,
-            Cursor = Cursors.Hand,
-        };
-        b.FlatAppearance.BorderSize = 0;
-        return b;
+        var c = new RoundedPanel { Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 12), Radius = radius, Fill = fill ?? CARD };
+        parent.Controls.Add(c, 0, row);
+        if (title.Length > 0) Tiny(c, title).SetBounds(16, 14, 320, 16);
+        return c;
     }
 
-    private static ComboBox DarkCombo() => new()
+    private static Label Tiny(RoundedPanel parent, string text)
+    {
+        var l = new Label
+        {
+            Text = Spaced(text), AutoSize = false, BackColor = parent.Fill, ForeColor = TEXT_DIM,
+            Font = new Font("Segoe UI", 7.5f, FontStyle.Bold), TextAlign = ContentAlignment.MiddleLeft,
+        };
+        parent.Controls.Add(l);
+        return l;
+    }
+
+    private static void StyleLabel(Label l, RoundedPanel parent, Font font, Color fg, ContentAlignment align)
+    {
+        l.AutoSize = false;
+        l.Font = font;
+        l.ForeColor = fg;
+        l.TextAlign = align;
+        l.BackColor = Color.Transparent;
+        parent.Controls.Add(l);
+    }
+
+    private static ComboBox Combo(bool big = false) => new()
     {
         DropDownStyle = ComboBoxStyle.DropDownList,
-        Dock = DockStyle.Fill,
-        BackColor = InputBg,
-        ForeColor = Text1,
+        BackColor = CARD_HI,
+        ForeColor = INK,
         FlatStyle = FlatStyle.Flat,
-        Margin = new Padding(3),
+        Font = big ? new Font("Consolas", 11f, FontStyle.Bold) : new Font("Consolas", 10f),
     };
 
-    private static RadioButton Radio(string text) => new()
-    {
-        Text = text,
-        AutoSize = true,
-        ForeColor = Text1,
-        Margin = new Padding(3, 3, 16, 3),
-    };
-
-    private static NumericUpDown Num(int decimals, decimal min, decimal max, decimal value, decimal inc) => new()
+    private static NumericUpDown Nud(int decimals, decimal min, decimal max, decimal value, decimal inc) => new()
     {
         DecimalPlaces = decimals,
         Minimum = min,
         Maximum = max,
         Value = value,
         Increment = inc,
-        Dock = DockStyle.Fill,
-        BackColor = InputBg,
-        ForeColor = Text1,
+        BackColor = CARD_HI,
+        ForeColor = INK,
         BorderStyle = BorderStyle.FixedSingle,
         TextAlign = HorizontalAlignment.Right,
-        Margin = new Padding(3),
+        Font = new Font("Consolas", 11f),
     };
 }
-
