@@ -4,7 +4,7 @@ namespace LsSpringTester;
 
 public sealed class TestSettings
 {
-    public double PreloadN { get; set; } = 0.10;
+    public double PreloadN { get; set; } = 1.0;
     public const double MM_PER_IN = 25.4;
     public double ApproachSpeedInPerMin { get; set; } = 100.0 / MM_PER_IN;  // preload speed, 100 mm/min
     public double TestSpeedInPerMin { get; set; } = 100.0 / MM_PER_IN;      // test speed, 100 mm/min
@@ -21,10 +21,15 @@ public sealed class TestSettings
     public double SettleSeconds { get; set; } = 1.0;
     public double SampleSeconds { get; set; } = 0.5;
     public double MaxPreloadSearchIn { get; set; } = 20.0 / MM_PER_IN;   // max travel hunting for 0 N / preload (0 = no limit)
-    public bool AutoPreload { get; set; } = false;            // preload above the spring's initial tension (per spring)
+    public bool AutoPreload { get; set; } = false;           // scale preload to the spring (see PreloadFor)
+    public double PreloadMinN { get; set; } = 0.1;
+    public double TrimPreloadN { get; set; } = 0.2;           // all NC002712 trim springs
+    public double PreloadFractionOfTestLoad { get; set; } = 0.05;
+    /// <summary>Upward preload approach uses the frame's LOAD-mode drive: the LS1+ stops itself at the preload.</summary>
+    public bool PreloadLoadModeDrive { get; set; } = true;            // preload above the spring's initial tension (per spring)
     public bool PreloadFromZero { get; set; } = true;        // RUN TEST: drive down to 0 N first, then up to preload
     public double PreloadFractionOfRange { get; set; } = 0.10;
-    public double ForceLimitN { get; set; } = 100.0;      // set to your load cell capacity
+    public double ForceLimitN { get; set; } = 200.0;      // 250 N load cell
     public double PositionToleranceIn { get; set; } = 0.002;   // ≈0.05 mm (AQM HOME_TOL_MM)
     public double StaleReadingSeconds { get; set; } = 1.0;
     public double PreloadOvershootN { get; set; } = 2.0;      // abort if preload overshoots by more than this
@@ -276,11 +281,12 @@ public sealed class MachineController : IDisposable
     /// </summary>
     public double PreloadFor(SpringSpec? spec)
     {
+        // Auto: 5 % of the spring's load at test length, kept between PreloadMinN (0.1 N) and PreloadN (max, 1 N).
+        // Small trims get ~0.1 N; big mains get the full 1 N (the frame's load-mode stop prevents overshoot).
+        if (spec?.Family == SpringFamily.Trim) return _s.TrimPreloadN;
         if (spec == null || !_s.AutoPreload) return _s.PreloadN;
-        double span = spec.TestLengthIn - spec.NominalFreeLengthIn;
-        double initialTensionLbf = Math.Max(0, spec.LoadNomLbf - spec.RateLbPerIn * span);
-        double lbf = initialTensionLbf + _s.PreloadFractionOfRange * spec.RateLbPerIn * span;
-        return Math.Max(_s.PreloadN, lbf * SpringSpec.N_PER_LBF);
+        double testLoadN = spec.LoadNomLbf * SpringSpec.N_PER_LBF;
+        return Math.Clamp(testLoadN * _s.PreloadFractionOfTestLoad, Math.Min(_s.PreloadMinN, _s.PreloadN), _s.PreloadN);
     }
 
     private Task<bool> FindPreloadCoreAsync(CancellationToken ct) => FindPreloadCoreAsync(null, ct);
@@ -294,21 +300,31 @@ public sealed class MachineController : IDisposable
         double preload = PreloadFor(spec);
         double band = Math.Max(0.01, preload * 0.05);
         Status($"Preload target {preload:0.###} N ({preload * SpringSpec.N_TO_LBS:0.000} lbf)" +
-               (spec != null && _s.AutoPreload ? " — auto, above initial tension." : "."));
+               (spec?.Family == SpringFamily.Trim ? " — trim spring preload." : spec != null && _s.AutoPreload ? " — auto, 5% of test load." : "."));
 
         if (FreshLatest().ForceN > preload + band)
         {
             if (!await ApproachForceAsync(preload, up: false, band, ct).ConfigureAwait(false)) return false;
             await WaitStoppedAsync(ct).ConfigureAwait(false);
         }
-        if (FreshLatest().ForceN < preload - band)
+        double allowed = Math.Max(_s.PreloadOvershootN, preload);       // how far past the preload is acceptable
+        double speed = _s.ApproachSpeedInPerMin;
+        for (int attempt = 1; FreshLatest().ForceN < preload - band; attempt++)
         {
-            if (!await ApproachForceAsync(preload, up: true, band, ct).ConfigureAwait(false)) return false;
-            await Task.Delay(200, ct).ConfigureAwait(false);
+            if (!await ApproachForceAsync(preload, up: true, band, ct, speed).ConfigureAwait(false)) return false;
+            await WaitStoppedAsync(ct).ConfigureAwait(false);
             double peak = FreshLatest().ForceN;
-            if (peak > preload + _s.PreloadOvershootN)
-                throw new InvalidOperationException(
-                    $"Overshot preload: {peak:0.00} N vs {preload:0.###} N target. Stopped — lower the preload speed.");
+            if (peak <= preload + allowed) break;
+            if (attempt >= 3)
+            {
+                Status($"Preload ended at {peak:0.00} N (target {preload:0.###} N) — spring is engaged, continuing.");
+                break;
+            }
+            // Overshot: back off below the preload, then come back up slower.
+            speed = Math.Max(speed * 0.3, 2.0 / TestSettings.MM_PER_IN);
+            Status($"Overshot to {peak:0.00} N — backing off and re-approaching at {speed * TestSettings.MM_PER_IN:0} mm/min…");
+            if (!await ApproachForceAsync(preload * 0.5, up: false, band, ct, speed).ConfigureAwait(false)) return false;
+            await WaitStoppedAsync(ct).ConfigureAwait(false);
         }
 
         Status($"Holding {_s.PreloadDwellSeconds:0.#} s to settle…");
@@ -335,13 +351,15 @@ public sealed class MachineController : IDisposable
     }
 
     /// <summary>Drive in one direction until force crosses the target (±band). Returns false if not reached.</summary>
-    private async Task<bool> ApproachForceAsync(double target, bool up, double band, CancellationToken ct)
+    private async Task<bool> ApproachForceAsync(double target, bool up, double band, CancellationToken ct, double? speedInPerMin = null)
     {
+        double speed = speedInPerMin ?? _s.ApproachSpeedInPerMin;
+        bool loadMode = up && _s.PreloadLoadModeDrive && !(_s.UseJogMotion || _s.PreloadUseJog);
         var start = FreshLatest();
         bool useJog = _s.UseJogMotion || _s.PreloadUseJog;
         var dir = up ? JogDirection.Extend : JogDirection.Retract;
         Status($"Force {start.ForceN:0.###} N → driving {(up ? "UP" : "DOWN")} to {target:0.###} N" +
-               (useJog ? " (slow jog)…" : $" at {_s.ApproachSpeedInPerMin * TestSettings.MM_PER_IN:0.#} mm/min…"));
+               (useJog ? " (slow jog)…" : $" at {speed * TestSettings.MM_PER_IN:0.#} mm/min" + (loadMode ? " (frame stops at load)…" : "…")));
 
         double limitIn = _s.MaxPreloadSearchIn > 0 ? _s.MaxPreloadSearchIn : 5.0;   // "no limit" → 127 mm drive target
         double searchTarget = start.PositionIn + (up ? 1 : -1) * limitIn;
@@ -351,7 +369,9 @@ public sealed class MachineController : IDisposable
             else
             {
                 await WaitStoppedAsync(ct).ConfigureAwait(false);
-                await _machine.MoveToAsync(searchTarget, _s.ApproachSpeedInPerMin, ct).ConfigureAwait(false);
+                // Load mode: the frame stops itself at the target force (no PC reading delay → no overshoot).
+                if (loadMode) await _machine.DriveToLoadAsync(target, speed, ct).ConfigureAwait(false);
+                else await _machine.MoveToAsync(searchTarget, speed, ct).ConfigureAwait(false);
             }
         }
         await Issue().ConfigureAwait(false);
@@ -368,7 +388,7 @@ public sealed class MachineController : IDisposable
             {
                 ct.ThrowIfCancellationRequested();
                 var r = FreshLatest();
-                if (grace.ElapsedMilliseconds > 600) CheckSpeed(speedMon, r, useJog ? null : _s.ApproachSpeedInPerMin);
+                if (grace.ElapsedMilliseconds > 600) CheckSpeed(speedMon, r, useJog ? null : speed);
                 else speedMon.MmPerMin(r);
 
                 if (up ? r.ForceN >= target - band : r.ForceN <= target + band) return true;
