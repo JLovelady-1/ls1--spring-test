@@ -59,6 +59,11 @@ public sealed class MainForm : Form
     private readonly RoundedButton btnPreload = new() { Text = "2   FIND PRELOAD" };
     private readonly RoundedButton btnRun = new() { Text = "2   RUN TEST" };
     private readonly Label lblHint = new();
+    private readonly CheckBox chkAutoReturn = new()      // not passcode-locked
+    {
+        Text = "Return after test", AutoSize = true, Checked = true,
+        ForeColor = TEXT_MID, BackColor = CARD, Font = new Font("Segoe UI", 9f),
+    };
     private RoundedPanel _resultCard = null!;
     private readonly Label lblResultTag = new();
     private readonly Label lblResult = new() { Text = "READY" };
@@ -93,7 +98,7 @@ public sealed class MainForm : Form
     };
     private readonly CheckBox chkAutoPreload = new()
     {
-        Text = "Auto preload per spring  (above initial tension + 10% of range)", AutoSize = true, Checked = false,
+        Text = "Auto main-spring preload  (5% of test load, 0.1 N min, field above = max)", AutoSize = true, Checked = false,
         ForeColor = TEXT_MID, BackColor = CARD, Font = new Font("Segoe UI", 9f),
     };
     private readonly CheckBox chkFromZero = new()
@@ -118,16 +123,17 @@ public sealed class MainForm : Form
     };
     private readonly RoundedButton btnConnect = new() { Text = "CONNECT" };
     private readonly RoundedButton btnDisconnect = new() { Text = "DISCONNECT" };
-    private readonly NumericUpDown numPreload = Nud(3, 0.010m, 5.000m, 0.100m, 0.010m);
+    private readonly NumericUpDown numPreload = Nud(3, 0.010m, 20.000m, 1.000m, 0.100m);
     private readonly NumericUpDown numApproach = Nud(1, 1.0m, 300.0m, 100.0m, 5.0m);
     private readonly NumericUpDown numPreloadDwell = Nud(1, 0.0m, 10.0m, 1.0m, 0.5m);
     private readonly NumericUpDown numSpeed = Nud(1, 1.0m, 300.0m, 100.0m, 5.0m);
     private readonly NumericUpDown numSettle = Nud(1, 0.0m, 30.0m, 1.0m, 0.5m);
     private readonly NumericUpDown numReturn = Nud(0, 20m, 2000m, 1200m, 50m);   // mm/min
     private readonly NumericUpDown numSearch = Nud(0, 0m, 200m, 20m, 5m);   // mm, 0 = no limit
+    private readonly NumericUpDown numTrimPreload = Nud(2, 0.05m, 2.00m, 0.20m, 0.05m);   // N
     private readonly NumericUpDown numP1 = Nud(0, 5m, 95m, 20m, 5m);    // % of travel
     private readonly NumericUpDown numP2 = Nud(0, 10m, 100m, 60m, 5m);  // % of travel
-    private readonly NumericUpDown numForceLimit = Nud(0, 1m, 5000m, 100m, 10m);
+    private readonly NumericUpDown numForceLimit = Nud(0, 1m, 250m, 200m, 10m);   // 250 N load cell
     private readonly CheckBox chkZeroForceAtPreload = new()
     {
         Text = "Zero force at preload too  (load result adds the preload back)", AutoSize = true, Checked = true,
@@ -286,11 +292,10 @@ public sealed class MainForm : Form
 
     private double PreloadPreviewN(SpringSpec s)
     {
-        double min = (double)numPreload.Value;
-        if (!chkAutoPreload.Checked) return min;
-        double span = s.TestLengthIn - s.NominalFreeLengthIn;
-        double it = Math.Max(0, s.LoadNomLbf - s.RateLbPerIn * span);
-        return Math.Max(min, (it + 0.10 * s.RateLbPerIn * span) * SpringSpec.N_PER_LBF);
+        if (s.Family == SpringFamily.Trim) return (double)numTrimPreload.Value;
+        double max = (double)numPreload.Value;
+        if (!chkAutoPreload.Checked) return max;
+        return Math.Clamp(s.LoadNomLbf * SpringSpec.N_PER_LBF * 0.05, Math.Min(0.1, max), max);
     }
 
     private void UpdateReturnText()
@@ -400,7 +405,7 @@ public sealed class MainForm : Form
 
         // sequence card
         var seq = Card(right, 1, "SEQUENCE");
-        seq.Controls.AddRange(new Control[] { btnTare, btnRun });
+        seq.Controls.AddRange(new Control[] { btnTare, btnRun, chkAutoReturn });
         foreach (var b in new[] { btnTare, btnPreload }) { b.Font = new Font("Segoe UI", 10f, FontStyle.Bold); b.Radius = 9; }
         btnRun.Font = new Font("Segoe UI Semibold", 11f, FontStyle.Bold);
         btnRun.Radius = 9;
@@ -410,7 +415,8 @@ public sealed class MainForm : Form
             int w = seq.Width, gap = 10, bw = (w - 32 - gap) / 3;
             btnTare.SetBounds(16, 38, bw, 46);
             btnRun.SetBounds(16 + bw + gap, 38, w - 32 - bw - gap, 46);
-            lblHint.SetBounds(16, 92, w - 32, 24);
+            lblHint.SetBounds(16, 92, w - 32 - 170, 24);
+            chkAutoReturn.Location = new Point(w - 16 - chkAutoReturn.PreferredSize.Width, 94);
         };
 
         // result card
@@ -546,7 +552,8 @@ public sealed class MainForm : Form
         cols.SetRowSpan(par, 2);
         Tiny(par, "TEST PARAMETERS").SetBounds(16, 16, 200, 16);
         y = 48;
-        FieldRow(par, "PRELOAD   (N)", numPreload, ref y, 130);
+        FieldRow(par, "TRIM PRELOAD   (N)", numTrimPreload, ref y, 130);
+        FieldRow(par, "MAIN PRELOAD   (N)", numPreload, ref y, 130);
         chkAutoPreload.Location = new Point(16, y + 2);
         par.Controls.Add(chkAutoPreload);
         y += 28;
@@ -622,6 +629,7 @@ public sealed class MainForm : Form
         numFree.ValueChanged += (_, _) => UpdateSpecLabel();
         numP1.ValueChanged += (_, _) => UpdateSpecLabel();
         numPreload.ValueChanged += (_, _) => UpdateSpecLabel();
+        numTrimPreload.ValueChanged += (_, _) => UpdateSpecLabel();
         chkAutoPreload.CheckedChanged += (_, _) => UpdateSpecLabel();
         numP2.ValueChanged += (_, _) => UpdateSpecLabel();
 
@@ -749,6 +757,8 @@ public sealed class MainForm : Form
             AddGridRow(r);
             _tared = false;         // next spring must be tared again
             _preloaded = false;
+            UpdateEnables();
+            if (chkAutoReturn.Checked) await ReturnAsync();   // drive back to the RETURN TO position
         }
         UpdateEnables();
     }
@@ -824,7 +834,7 @@ public sealed class MainForm : Form
             $"PASS BAND     {s.RateMinLbPerIn:0.000} – {s.RateMaxLbPerIn:0.000} lb/in\n" +
             $"RATE POINTS   {travel * (double)numP1.Value / 100:0.000} / {travel * (double)numP2.Value / 100:0.000} in from preload  ({numP1.Value:0}% / {numP2.Value:0}%)\n" +
             $"TRAVEL        {travel:0.000} in   ({travel * 25.4:0.00} mm) from preload\n" +
-            $"PRELOAD       {PreloadPreviewN(s):0.000} N  ({PreloadPreviewN(s) * SpringSpec.N_TO_LBS:0.000} lbf){(chkAutoPreload.Checked ? "  auto" : "")}\n" +
+            $"PRELOAD       {PreloadPreviewN(s):0.000} N  ({PreloadPreviewN(s) * SpringSpec.N_TO_LBS:0.000} lbf){(s.Family == SpringFamily.Trim ? "  trim" : chkAutoPreload.Checked ? "  auto" : "")}\n" +
             $"COLOR         {s.ColorText}";
     }
 
@@ -1061,6 +1071,7 @@ public sealed class MainForm : Form
     {
         _settings.PreloadN = (double)numPreload.Value;
         _settings.AutoPreload = chkAutoPreload.Checked;
+        _settings.TrimPreloadN = (double)numTrimPreload.Value;
         _settings.PreloadFromZero = chkFromZero.Checked;
         _settings.ApproachSpeedInPerMin = (double)numApproach.Value / TestSettings.MM_PER_IN;
         _settings.PreloadDwellSeconds = (double)numPreloadDwell.Value;
